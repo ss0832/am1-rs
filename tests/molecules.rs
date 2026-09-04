@@ -31,7 +31,13 @@ fn water_optimizes_to_am1_minimum() {
         0.0,
     )
     .unwrap();
-    let res = optimize(&mol, &params(), &Am1Options::default(), &OptOptions::default()).unwrap();
+    let res = optimize(
+        &mol,
+        &params(),
+        &Am1Options::default(),
+        &OptOptions::default(),
+    )
+    .unwrap();
     assert!(res.converged);
     assert!((res.scf.heat_of_formation_kcal + 59.24).abs() < 0.3);
 }
@@ -47,7 +53,11 @@ fn heavy_element_bromine_runs() {
     let qsum: f64 = r.charges.iter().sum();
     assert!(qsum.abs() < 1e-6);
     // Sanity band on the heat of formation (AM1 HBr is a small negative number).
-    assert!(r.heat_of_formation_kcal.abs() < 60.0, "dHf {}", r.heat_of_formation_kcal);
+    assert!(
+        r.heat_of_formation_kcal.abs() < 60.0,
+        "dHf {}",
+        r.heat_of_formation_kcal
+    );
 }
 
 #[test]

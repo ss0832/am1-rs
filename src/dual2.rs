@@ -24,14 +24,22 @@ pub struct Dual2 {
 impl Dual2 {
     #[inline]
     pub fn constant(x: f64) -> Self {
-        Self { v: x, g: [0.0; 3], h: [[0.0; 3]; 3] }
+        Self {
+            v: x,
+            g: [0.0; 3],
+            h: [[0.0; 3]; 3],
+        }
     }
     /// Independent variable seeded along axis `i` (∂/∂x_i = 1, all second derivatives 0).
     #[inline]
     pub fn var(x: f64, i: usize) -> Self {
         let mut g = [0.0; 3];
         g[i] = 1.0;
-        Self { v: x, g, h: [[0.0; 3]; 3] }
+        Self {
+            v: x,
+            g,
+            h: [[0.0; 3]; 3],
+        }
     }
     /// Chain rule for a smooth unary function φ evaluated at `self.v`, given
     /// `val = φ(v)`, `d1 = φ'(v)`, `d2 = φ''(v)`:
@@ -64,7 +72,11 @@ impl Add for Dual2 {
                 h[a][b] = self.h[a][b] + o.h[a][b];
             }
         }
-        Self { v: self.v + o.v, g, h }
+        Self {
+            v: self.v + o.v,
+            g,
+            h,
+        }
     }
 }
 impl Sub for Dual2 {
@@ -79,7 +91,11 @@ impl Sub for Dual2 {
                 h[a][b] = self.h[a][b] - o.h[a][b];
             }
         }
-        Self { v: self.v - o.v, g, h }
+        Self {
+            v: self.v - o.v,
+            g,
+            h,
+        }
     }
 }
 impl Mul for Dual2 {
@@ -100,11 +116,21 @@ impl Mul for Dual2 {
                     + self.v * o.h[a][b];
             }
         }
-        Self { v: self.v * o.v, g, h }
+        Self {
+            v: self.v * o.v,
+            g,
+            h,
+        }
     }
 }
 impl Div for Dual2 {
     type Output = Self;
+    // Multiplication inside `Div` is deliberate, not the copy-paste slip clippy is looking for.
+    // A second-order dual has to carry the quotient rule through to both derivative orders, and
+    // routing division through `recip` -- which already implements `d(1/u) = -u'/u²` and its
+    // second derivative -- composes those chains correctly by construction. Writing the quotient
+    // rule out again here would be a second place for it to be wrong.
+    #[allow(clippy::suspicious_arithmetic_impl)]
     #[inline]
     fn div(self, o: Self) -> Self {
         self * o.recip()
@@ -131,14 +157,22 @@ impl Add<f64> for Dual2 {
     type Output = Self;
     #[inline]
     fn add(self, o: f64) -> Self {
-        Self { v: self.v + o, g: self.g, h: self.h }
+        Self {
+            v: self.v + o,
+            g: self.g,
+            h: self.h,
+        }
     }
 }
 impl Sub<f64> for Dual2 {
     type Output = Self;
     #[inline]
     fn sub(self, o: f64) -> Self {
-        Self { v: self.v - o, g: self.g, h: self.h }
+        Self {
+            v: self.v - o,
+            g: self.g,
+            h: self.h,
+        }
     }
 }
 impl Mul<f64> for Dual2 {
@@ -153,7 +187,11 @@ impl Mul<f64> for Dual2 {
                 h[a][b] = self.h[a][b] * o;
             }
         }
-        Self { v: self.v * o, g, h }
+        Self {
+            v: self.v * o,
+            g,
+            h,
+        }
     }
 }
 impl Div<f64> for Dual2 {
@@ -224,6 +262,31 @@ impl Scalar for Dual2 {
         } else {
             -self
         }
+    }
+    #[inline]
+    fn ln(self) -> Self {
+        let r = if self.v != 0.0 { 1.0 / self.v } else { 0.0 };
+        self.chain(self.v.ln(), r, -r * r)
+    }
+    #[inline]
+    fn erf(self) -> Self {
+        let (d1, d2) = crate::dual::erf_derivatives(self.v);
+        self.chain(libm::erf(self.v), d1, d2)
+    }
+    #[inline]
+    fn erfc(self) -> Self {
+        let (d1, d2) = crate::dual::erf_derivatives(self.v);
+        self.chain(libm::erfc(self.v), -d1, -d2)
+    }
+    #[inline]
+    fn erfcx(self) -> Self {
+        let (v, d1, d2) = crate::dual::erfcx_derivatives(self.v);
+        self.chain(v, d1, d2)
+    }
+    #[inline]
+    fn cos(self) -> Self {
+        let (s, c) = self.v.sin_cos();
+        self.chain(c, -s, -c)
     }
 }
 

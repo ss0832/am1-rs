@@ -37,7 +37,7 @@ pub fn slater_locals_numeric<S: Scalar>(
     let i_sps = overlap_sto(na, zsa, 0, 0, nb, zpb, 1, r); // s(a) | p_sigma(b)
     let i_pps = overlap_sto(na, zpa, 1, 0, nb, zpb, 1, r); // p_sigma | p_sigma
     let i_ppp = overlap_sto(na, zpa, 1, 1, nb, zpb, 1, r); // p_pi | p_pi
-    // Match the analytic kernel's sign convention.
+                                                           // Match the analytic kernel's sign convention.
     (s_ss, i_pss, -i_sps, -i_pps, i_ppp)
 }
 
@@ -45,6 +45,9 @@ pub fn slater_locals_numeric<S: Scalar>(
 /// `<chi(na, la, m; za)_a | chi(nb, lb, m; zb)_b>` for magnetic number `m in {0,1}`.
 /// `m_a` selects sigma (0) or pi (1) for the p orbitals. Generic over the scalar type; only the
 /// radial factor depends on `r`, so the angular parts and quadrature nodes are `f64` constants.
+// `(n, ζ, l)` for each centre, the shared `m`, and the separation. That is the Slater overlap's
+// actual signature; a struct would only rename it.
+#[allow(clippy::too_many_arguments)]
 fn overlap_sto<S: Scalar>(na: u8, za: f64, la: u8, m_a: u8, nb: u8, zb: f64, lb: u8, r: S) -> S {
     let na_i = na as i32;
     let nb_i = nb as i32;
@@ -66,15 +69,20 @@ fn overlap_sto<S: Scalar>(na: u8, za: f64, la: u8, m_a: u8, nb: u8, zb: f64, lb:
     let r_val = r.val();
     let half_r = r * 0.5; // scalar (carries derivatives)
     let half_r_val = 0.5 * r_val; // f64, for the (fixed) integration domain
-    // Integration ranges: eta in [-1, 1]; xi in [1, xi_max] with the exponential decay
-    // e^{-(za+zb) r xi / 2} captured generously. The domain is fixed from r's value.
+                                  // Integration ranges: eta in [-1, 1]; xi in [1, xi_max] with the exponential decay
+                                  // e^{-(za+zb) r xi / 2} captured generously. The domain is fixed from r's value.
     let p = (za + zb) * half_r_val;
     let xi_max = 1.0 + 60.0 / p.max(0.05);
-    let (xn, xw) = gauss_legendre_mapped(48, 1.0, xi_max);
-    let (en, ew) = gauss_legendre_mapped(40, -1.0, 1.0);
+    // Cached [-1, 1] rules, mapped inline. The eta range *is* [-1, 1], so it needs no map at
+    // all; xi is affine onto [1, xi_max].
+    let (xi_t, xi_wt) = xi_rule();
+    let (en, ew) = eta_rule();
+    let xi_mid = 0.5 * (1.0 + xi_max);
+    let xi_half = 0.5 * (xi_max - 1.0);
 
     let mut sum = S::cst(0.0);
-    for (i, &xi) in xn.iter().enumerate() {
+    for (i, &t) in xi_t.iter().enumerate() {
+        let xi = xi_mid + xi_half * t;
         for (j, &eta) in en.iter().enumerate() {
             let ra_val = half_r_val * (xi + eta);
             let rb_val = half_r_val * (xi - eta);
@@ -100,7 +108,7 @@ fn overlap_sto<S: Scalar>(na: u8, za: f64, la: u8, m_a: u8, nb: u8, zb: f64, lb:
             let rb = half_r * (xi - eta);
             let radial = ra.powi(na_i - 1) * rb.powi(nb_i - 1) * (ra * (-za) - rb * zb).exp();
             let jac = xi * xi - eta * eta;
-            let wcoef = xw[i] * ew[j] * ang_a * ang_b * jac; // f64
+            let wcoef = xi_half * xi_wt[i] * ew[j] * ang_a * ang_b * jac; // f64
             sum = sum + radial * wcoef;
         }
     }
@@ -116,7 +124,31 @@ fn factorial(n: u64) -> f64 {
     (1..=n).map(|k| k as f64).product::<f64>().max(1.0)
 }
 
+/// Number of Gauss–Legendre nodes along the prolate-spheroidal coordinates.
+const XI_ORDER: usize = 48;
+const ETA_ORDER: usize = 40;
+
+/// The `[-1, 1]` Gauss–Legendre rule for a fixed order, computed once per process.
+///
+/// The nodes depend only on the order, but they were being re-derived by Newton iteration on
+/// the Legendre recurrence at every call — and this kernel is called per orbital-pair channel
+/// per atom pair for every `n >= 4` element (Zn, Ge, As, Se, Br, Sb, Te, I, Hg), including
+/// once per `Dual2` Hessian evaluation.
+fn xi_rule() -> &'static (Vec<f64>, Vec<f64>) {
+    static R: std::sync::OnceLock<(Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
+    R.get_or_init(|| gauss_legendre(XI_ORDER))
+}
+
+fn eta_rule() -> &'static (Vec<f64>, Vec<f64>) {
+    static R: std::sync::OnceLock<(Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
+    R.get_or_init(|| gauss_legendre(ETA_ORDER))
+}
+
 /// Gauss–Legendre nodes and weights on `[a, b]` (nodes computed by Newton iteration).
+///
+/// The quadrature itself now maps the cached `[-1, 1]` rule inline; this stays as the
+/// self-contained form the accuracy test exercises.
+#[cfg(test)]
 fn gauss_legendre_mapped(n: usize, a: f64, b: f64) -> (Vec<f64>, Vec<f64>) {
     let (nodes, weights) = gauss_legendre(n);
     let mid = 0.5 * (a + b);
@@ -198,8 +230,8 @@ mod tests {
             let z = 1.3_f64;
             let (s111, _, _, _, _) = slater_locals_numeric(2, z, z, 2, z, z, rr);
             let p = z * rr;
-            let exact = (-p).exp()
-                * (1.0 + p + 4.0 / 9.0 * p * p + p * p * p / 9.0 + p * p * p * p / 45.0);
+            let exact =
+                (-p).exp() * (1.0 + p + 4.0 / 9.0 * p * p + p * p * p / 9.0 + p * p * p * p / 45.0);
             assert!((s111 - exact).abs() < 5e-4, "R={rr}: {s111} vs {exact}");
         }
     }

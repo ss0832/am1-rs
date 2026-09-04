@@ -9,8 +9,9 @@
 //! PySEQM reference implementation).
 
 use crate::constants::AM1_EV;
-use crate::data_tables::{self, AM1_PARAM_CSV};
+use crate::data_tables::{self, AM1_PARAM_CSV, RM1_PARAM_CSV};
 use crate::error::{Am1Error, Result};
+use crate::method::NddoMethod;
 use std::collections::HashMap;
 
 /// Per-element AM1 parameters plus derived NDDO quantities.
@@ -57,16 +58,77 @@ impl Am1Element {
 #[derive(Clone, Debug, Default)]
 pub struct Am1Parameters {
     pub elements: HashMap<u8, Am1Element>,
+    /// Which parameterization these values belong to. AM1 and RM1 share a functional form, so
+    /// this is carried for reporting and for the "which elements does this method cover"
+    /// error message rather than to switch code paths.
+    pub method: NddoMethod,
 }
 
 impl Am1Parameters {
     /// Load the standard embedded AM1 parameter set.
     pub fn standard() -> Result<Self> {
-        Self::from_csv(AM1_PARAM_CSV)
+        Self::for_method(NddoMethod::Am1)
+    }
+
+    /// Load the embedded parameter set for `method`, from a per-method cache.
+    ///
+    /// # Why this is cached
+    ///
+    /// Building a set is not free: it parses a hundred-odd CSV rows and then, per element, runs
+    /// the **secant solves** for `rho1` and `rho2` ([`derive_parameters`]). That is invisible
+    /// against a large molecule and dominant against a small one — and every function on the
+    /// Python surface calls this at its top, so a molecular-dynamics loop on a water molecule was
+    /// paying for it on every step. It is a fixed per-call cost, which is exactly the kind a
+    /// large-system profile cannot see.
+    ///
+    /// The returned set is a clone of the cached one. [`Self::shared`] avoids even that for a
+    /// caller that only needs to read.
+    pub fn for_method(method: NddoMethod) -> Result<Self> {
+        Self::shared(method).cloned()
+    }
+
+    /// The cached parameter set for `method`, borrowed rather than cloned.
+    ///
+    /// The sets are immutable once built and live for the process, so a caller that only reads
+    /// them — which is every caller inside the crate — can borrow. Returns the stored `Result` by
+    /// reference so a malformed embedded table still surfaces as an error rather than a panic.
+    pub fn shared(method: NddoMethod) -> Result<&'static Self> {
+        use std::sync::OnceLock;
+        static AM1: OnceLock<std::result::Result<Am1Parameters, String>> = OnceLock::new();
+        static RM1: OnceLock<std::result::Result<Am1Parameters, String>> = OnceLock::new();
+
+        let build = |text: &str| -> std::result::Result<Am1Parameters, String> {
+            let mut params = Self::from_csv(text).map_err(|e| e.to_string())?;
+            params.method = method;
+            Ok(params)
+        };
+        let slot = match method {
+            NddoMethod::Am1 => AM1.get_or_init(|| build(AM1_PARAM_CSV)),
+            NddoMethod::Rm1 => RM1.get_or_init(|| build(RM1_PARAM_CSV)),
+        };
+        slot.as_ref().map_err(|e| Am1Error::InvalidInput(e.clone()))
     }
 
     pub fn element(&self, z: u8) -> Result<&Am1Element> {
-        self.elements.get(&z).ok_or(Am1Error::MissingElement(z))
+        self.elements.get(&z).ok_or_else(|| {
+            // Naming the method matters here: RM1 covers ten elements where AM1 covers
+            // twenty-one, so "missing parameter block for Z=14" is a confusing thing to read
+            // when silicon is perfectly well parameterized -- just not by RM1.
+            Am1Error::ElementNotParameterized {
+                method: self.method.display_name(),
+                z,
+                supported: self.supported_symbols().join(", "),
+            }
+        })
+    }
+
+    /// Element symbols this parameter set covers, in ascending atomic number.
+    pub fn supported_symbols(&self) -> Vec<&'static str> {
+        let mut zs: Vec<u8> = self.elements.keys().copied().collect();
+        zs.sort_unstable();
+        zs.iter()
+            .filter_map(|&z| crate::system::z_to_symbol(z))
+            .collect()
     }
 
     pub fn from_csv(text: &str) -> Result<Self> {
@@ -188,7 +250,10 @@ impl Am1Parameters {
                 "no AM1 elements parsed from parameter table".to_string(),
             ));
         }
-        Ok(Self { elements })
+        Ok(Self {
+            elements,
+            method: NddoMethod::default(),
+        })
     }
 }
 

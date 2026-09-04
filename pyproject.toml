@@ -1,21 +1,85 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
+requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "am1-rs-python"
-version = "0.1.3"
-description = "AM1 semiempirical method (am1-rs) with a Python-native API and an ASE calculator"
+# Single source of truth: maturin reads the version from Cargo.toml. Keeping a literal here
+# as well is how three copies of the version got out of step.
+dynamic = ["version"]
+description = "AM1-family semiempirical methods (AM1, RM1) with a Python-native API and an ASE calculator: energies, analytic gradients, CPHF Hessians, AM1-BCC charges, and periodic boundary conditions with k-points, analytic stress and phonons"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [{ name = "ss0832" }]
 dependencies = ["numpy>=1.21"]
+
+# PEP 639. The SPDX expression is the licence of this project; `license-files` lists the notice
+# files that must travel with every distribution, wheels included. That is not decoration:
+# clause 2 of the BSD-3-Clause covering the bundled PySEQM-derived parameters requires the
+# copyright notice to accompany binary redistributions, and a wheel is a binary redistribution.
+license = "GPL-3.0-or-later"
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/*/LICENSE",
+]
+
+keywords = [
+    "chemistry",
+    "computational-chemistry",
+    "quantum-chemistry",
+    "semiempirical",
+    "am1",
+    "rm1",
+    "nddo",
+    "ase",
+    "molecular-dynamics",
+    "periodic-boundary-conditions",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
 
 [project.optional-dependencies]
 ase = ["ase>=3.22"]
 
+# `pip install am1-rs-python` puts the CLI on PATH.
+#
+# The Rust crate builds its own `am1_rs_cli` binary, but a wheel cannot ship that alongside the
+# extension module, so `am1_rs.__main__` mirrors it over the same native bindings — same modes,
+# same flags, same output. `python -m am1_rs` works too, for environments where the scripts
+# directory is not on PATH.
+[project.scripts]
+am1-rs = "am1_rs.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ss0832/am1-rs"
+Repository = "https://github.com/ss0832/am1-rs"
+Issues = "https://github.com/ss0832/am1-rs/issues"
+Changelog = "https://github.com/ss0832/am1-rs/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ss0832/am1-rs/tree/main/docs"
+
 [tool.maturin]
-features = ["python"]
+features = ["extension-module"]
 python-source = "python"
 module-name = "am1_rs._native"
+# The notice files are carried by `license-files` above, which puts them under
+# `dist-info/licenses/` where they belong. Listing them in `include` as well would additionally
+# drop them into the root of site-packages, which pollutes every environment that installs this.
+include = [
+    { path = "third_party/**/*.DEF", format = "sdist" },
+    { path = "docs/**/*.md", format = "sdist" },
+    { path = "tests/**/*.py", format = "sdist" },
+]

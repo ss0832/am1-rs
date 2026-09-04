@@ -12,11 +12,11 @@ use crate::basis::Basis;
 use crate::constants::{AU_DIPOLE_TO_DEBYE, EV_TO_KCAL};
 use crate::error::{Am1Error, Result};
 use crate::fock::{build_fock, build_fock_spin};
-use crate::hamiltonian::{build_core, CoreHamiltonian};
+use crate::hamiltonian::CoreHamiltonian;
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
 use crate::params::Am1Parameters;
-use crate::repulsion::core_core_energy;
+
 use crate::system::Molecule;
 
 /// Choice of SCF reference (spin treatment) — restricted vs unrestricted.
@@ -64,6 +64,97 @@ pub struct Am1Options {
     pub accelerator: ScfAccelerator,
     /// Commutator-error norm below which the ADIIS→CDIIS hybrid switches to CDIIS.
     pub adiis_switch: f64,
+    /// Real-space cutoff (Bohr) for periodic image sums. Ignored for a molecule, where every
+    /// pair is kept regardless — the NDDO two-centre integrals decay as `1/R`, so screening
+    /// them by distance changes the answer rather than saving work that did not matter.
+    ///
+    /// Under a cell this truncation *is* an approximation: the same `1/R` tail makes the sum
+    /// only conditionally convergent, so the result must be checked against the cutoff until
+    /// the Ewald treatment replaces it.
+    pub realspace_cutoff: f64,
+    /// Sum the long-range monopole electrostatics by **Ewald summation** rather than by the
+    /// real-space cutoff.
+    ///
+    /// Default `true`, and a no-op without a three-dimensional cell — a molecule has no lattice
+    /// sum to correct, and a slab or a chain would need a reciprocal sum that is not implemented
+    /// (asking for one there is an error rather than a different answer).
+    ///
+    /// This is what makes a **charged** cell meaningful. Without it the monopole sum
+    /// `Σ_T Q²/|T|` diverges: a +1 water cell in an 8 Å cube measured −331 eV at a 20 Bohr
+    /// cutoff and +72 eV at 130 Bohr. With it the energy is cutoff-independent, under the
+    /// tin-foil boundary condition that a neutralizing background implies.
+    ///
+    /// The `R⁻³` part of the Klopman–Ohno kernel diverges separately and more weakly; that is
+    /// [`Self::klopman_ohno_tail`], which is a different switch because it is a different sum.
+    pub ewald: bool,
+    /// Add the analytic **Klopman–Ohno `R⁻³` tail** beyond the pair list. Default `true`.
+    ///
+    /// [`Self::ewald`] corrects the `1/R` channel exactly. But the pair list summed the full NDDO
+    /// kernel `γ_η(R) = e²/√(R² + η²)`, and `γ_η − 1/R = −η²/(2R³) + …` was left truncated —
+    /// `Σ_T |T|⁻³` diverges logarithmically in three dimensions, so the total energy drifted with
+    /// [`Self::realspace_cutoff`] and converged to nothing. `false` restores the 0.2.1 behaviour.
+    ///
+    /// The counterpart of [`crate::pbc::PbcOptions::klopman_ohno_tail`], and it has to be set the
+    /// same way: the two paths are checked against each other at Γ (`tests/pbc_hessian.rs`), and
+    /// leaving one tailed and the other not put the analytic Hessian 2.1e-3 eV/Bohr² from its
+    /// finite difference.
+    ///
+    /// See `crate::pbc::ewald::klopman_ohno_tail_matrix` — which is `pub(crate)`, so the
+    /// derivation is in the source rather than the API docs.
+    pub klopman_ohno_tail: bool,
+    /// Distance (Bohr) beyond which an **image** pair's exchange contribution is dropped.
+    /// `None` keeps all of it, which is right for a molecule and wrong for a periodic cell.
+    ///
+    /// See [`crate::hamiltonian::PairIntegral::exchange_scale`]: NDDO's two-centre exchange
+    /// integral decays as `1/R` and is finite only because the density matrix element it
+    /// contracts against decays. At Γ-only sampling that element does not decay, so the image
+    /// sum diverges. This is an explicit approximation standing in for the k-point sampling
+    /// that would make the density matrix decay on its own.
+    pub exchange_cutoff: Option<f64>,
+    /// Separation (Bohr) beyond which a pair's electrostatics is treated as a **monopole**
+    /// rather than through the full Dewar-Sabelli-Klopman multipole block.
+    ///
+    /// `None` (the default) keeps every pair exact, which is what every result in this crate
+    /// was validated against. Setting it is an explicit accuracy-for-speed trade: the neglected
+    /// dipole and quadrupole channels fall as `(d/R)^2`, so the error shrinks quadratically
+    /// with the cutoff, and [`crate::farfield`] measures it rather than bounding it by
+    /// argument.
+    ///
+    /// The reason it helps is that the all-pairs Fock build is the measured bottleneck of a
+    /// large run -- 62 % of a 1029-atom divide-and-conquer calculation -- and a monopole pair
+    /// costs about a hundredth of a full block.
+    pub multipole_cutoff: Option<f64>,
+    /// Uniform external **electric field**, in eV per (e·Bohr), or `None` for no field.
+    ///
+    /// The energy becomes `E(F) = E₀ − μ·F` with `μ` this model's own dipole; see
+    /// [`crate::dipole`] for the operator and the full sign convention. The gradient and the
+    /// analytic Hessian both account for it: the force on atom `a` gains `+Q_a F`, and because
+    /// the dipole operator is *linear* in the nuclear positions the field contributes nothing to
+    /// the fixed-density second derivative — it reaches the Hessian only through the CPHF
+    /// response.
+    ///
+    /// **Molecules only.** A cell plus a field is an error rather than an approximation: `F·R`
+    /// is unbounded along a periodic direction. The periodic analogue is the clamped-ion field
+    /// response behind [`crate::pbc::dielectric_tensor`].
+    pub electric_field: Option<Vec3>,
+}
+
+impl Am1Options {
+    /// The subset of these options the core Hamiltonian build needs.
+    ///
+    /// One conversion, so that a path which builds `H_core` for itself — the Hessian, the
+    /// divide-and-conquer driver — cannot quietly disagree with the SCF about which corrections
+    /// are switched on. Getting that wrong is invisible: the calculation runs and returns a
+    /// number from a slightly different Hamiltonian.
+    pub fn core_build(&self) -> crate::hamiltonian::CoreBuildOptions {
+        crate::hamiltonian::CoreBuildOptions {
+            exchange_cutoff: self.exchange_cutoff,
+            use_ewald: self.ewald,
+            klopman_ohno_tail: self.klopman_ohno_tail.then_some(self.realspace_cutoff),
+            multipole_cutoff: self.multipole_cutoff,
+            electric_field: self.electric_field,
+        }
+    }
 }
 
 impl Default for Am1Options {
@@ -78,6 +169,12 @@ impl Default for Am1Options {
             use_diis: true,
             accelerator: ScfAccelerator::AdiisCdiis,
             adiis_switch: 0.1,
+            realspace_cutoff: 40.0,
+            ewald: true,
+            klopman_ohno_tail: true,
+            exchange_cutoff: None,
+            multipole_cutoff: None,
+            electric_field: None,
         }
     }
 }
@@ -87,11 +184,28 @@ pub struct Am1Result {
     pub density: Matrix,
     /// Spin density `P_α − P_β` (open-shell UHF only; `None` for RHF).
     pub spin_density: Option<Matrix>,
+    /// Orbital energies (eV). For UHF these are the **α** channel; see [`Am1Result::beta`].
     pub mo_energies: Vec<f64>,
+    /// MO coefficients, columns are orbitals. For UHF these are the **α** channel.
     pub mo_coeff: Matrix,
+    /// Number of occupied orbitals — doubly occupied for RHF, α-occupied for UHF.
     pub n_occ: usize,
+    /// The **β** spin channel, present only for an unrestricted run.
+    ///
+    /// UHF solves two eigenproblems; before 0.2.1 only the α one survived into the result, so a
+    /// spin-polarized wavefunction could not be written out and the β frontier orbitals could
+    /// not be reported at all.
+    pub beta: Option<BetaOrbitals>,
     pub electronic_ev: f64,
     pub core_ev: f64,
+    /// The **nuclear** half of the external-field interaction, `−F · Σ_a Z_a R_a`, in eV; zero
+    /// without a field.
+    ///
+    /// Only the nuclear half, because the electronic half `+Tr[P h^F]` is already inside
+    /// `electronic_ev` — it enters through `H_core`, which is where the field operator is added.
+    /// Reporting it separately is what makes `total_ev = electronic_ev + core_ev +
+    /// field_nuclear_ev` add up without the field term being invisible.
+    pub field_nuclear_ev: f64,
     pub total_ev: f64,
     pub heat_of_formation_kcal: f64,
     pub charges: Vec<f64>,
@@ -99,6 +213,9 @@ pub struct Am1Result {
     pub dipole_magnitude: f64,
     pub homo_ev: Option<f64>,
     pub lumo_ev: Option<f64>,
+    /// β-channel frontier orbital energies (eV), for an unrestricted run only.
+    pub homo_beta_ev: Option<f64>,
+    pub lumo_beta_ev: Option<f64>,
     pub iterations: usize,
     pub converged: bool,
     /// True when the UHF (open-shell) path was used.
@@ -131,18 +248,58 @@ struct ScfState {
     mo_energies: Vec<f64>,
     mo_coeff: Matrix,
     n_occ: usize,
+    /// The β channel, for an unrestricted run. `None` for RHF, where the two channels coincide.
+    beta: Option<BetaOrbitals>,
     electronic_ev: f64,
     converged: bool,
     iterations: usize,
     unrestricted: bool,
 }
 
-pub fn run_am1(molecule: &Molecule, params: &Am1Parameters, options: &Am1Options) -> Result<Am1Result> {
+/// The β spin channel's orbitals.
+///
+/// UHF solves two eigenproblems and used to return only the α one, so a spin-polarized
+/// wavefunction could not be written out, a β HOMO could not be reported, and the β orbital
+/// energies — which are what a spin-polarized ionization potential needs — were simply gone.
+#[derive(Clone, Debug)]
+pub struct BetaOrbitals {
+    pub energies: Vec<f64>,
+    pub coeff: Matrix,
+    pub n_occ: usize,
+}
+
+pub fn run_am1(
+    molecule: &Molecule,
+    params: &Am1Parameters,
+    options: &Am1Options,
+) -> Result<Am1Result> {
     if options.multiplicity < 1 {
-        return Err(Am1Error::InvalidInput("multiplicity must be >= 1".to_string()));
+        return Err(Am1Error::InvalidInput(
+            "multiplicity must be >= 1".to_string(),
+        ));
     }
-    let basis = Basis::build(molecule, params)?;
-    let core = build_core(molecule, &basis, params)?;
+    crate::linalg::enable_parallelism();
+    // One pair list serves both the core Hamiltonian and the core-core repulsion. For a
+    // molecule it is every pair; for a periodic cell it is every pair within the real-space
+    // cutoff, including an atom with its own images, and the assembly below is then the
+    // Gamma-point Bloch sum because e^{ik·T} = 1 at k = 0.
+    let neighbors = crate::neighbors::NeighborList::build_screened(
+        molecule,
+        options.realspace_cutoff,
+        options.multipole_cutoff,
+    );
+    let (basis, core) = {
+        let _t = crate::timing::Timer::start("basis+core");
+        let basis = Basis::build(molecule, params)?;
+        let core = crate::hamiltonian::build_core_with_neighbors(
+            molecule,
+            &basis,
+            params,
+            &neighbors,
+            options.core_build(),
+        )?;
+        (basis, core)
+    };
 
     let mut n_elec = 0.0;
     for atom in &molecule.atoms {
@@ -191,8 +348,14 @@ pub fn run_am1(molecule: &Molecule, params: &Am1Parameters, options: &Am1Options
         uhf_loop(molecule, &basis, params, &core, n_alpha, n_beta, options)?
     };
 
-    let core_ev = core_core_energy(molecule, params)?;
-    let total_ev = state.electronic_ev + core_ev;
+    let core_ev = crate::repulsion::core_core_energy_with_neighbors(molecule, params, &neighbors)?;
+    // The field's nuclear half. Its electronic half rode in through `H_core`, so this is all
+    // that is left to add. See `crate::dipole` for the sign convention.
+    let field_nuclear_ev = match options.electric_field {
+        Some(f) => crate::dipole::field_core_energy(molecule, params, f)?,
+        None => 0.0,
+    };
+    let total_ev = state.electronic_ev + core_ev + field_nuclear_ev;
 
     let mut e_isol_sum = 0.0;
     let mut eheat_sum = 0.0;
@@ -243,6 +406,18 @@ pub fn run_am1(molecule: &Molecule, params: &Am1Parameters, options: &Am1Options
     let nao = basis.nao;
     let homo_ev = (state.n_occ >= 1).then(|| state.mo_energies[state.n_occ - 1]);
     let lumo_ev = (state.n_occ < nao).then(|| state.mo_energies[state.n_occ]);
+    let (homo_beta_ev, lumo_beta_ev) = match &state.beta {
+        Some(b) => (
+            (b.n_occ >= 1).then(|| b.energies[b.n_occ - 1]),
+            (b.n_occ < nao).then(|| b.energies[b.n_occ]),
+        ),
+        None => (None, None),
+    };
+
+    // No `timing::report` here. Reporting clears the accumulator, so a library function that
+    // reported would truncate the measurement at its own boundary — profiling a gradient printed
+    // only the SCF phases for exactly that reason. The top-level caller reports; see
+    // `crate::timing`.
 
     Ok(Am1Result {
         density: state.density,
@@ -250,8 +425,10 @@ pub fn run_am1(molecule: &Molecule, params: &Am1Parameters, options: &Am1Options
         mo_energies: state.mo_energies,
         mo_coeff: state.mo_coeff,
         n_occ: state.n_occ,
+        beta: state.beta,
         electronic_ev: state.electronic_ev,
         core_ev,
+        field_nuclear_ev,
         total_ev,
         heat_of_formation_kcal,
         charges,
@@ -259,6 +436,8 @@ pub fn run_am1(molecule: &Molecule, params: &Am1Parameters, options: &Am1Options
         dipole_magnitude,
         homo_ev,
         lumo_ev,
+        homo_beta_ev,
+        lumo_beta_ev,
         iterations: state.iterations,
         converged: state.converged,
         unrestricted: state.unrestricted,
@@ -292,27 +471,51 @@ fn sad_density(molecule: &Molecule, basis: &Basis, params: &Am1Parameters) -> Re
 }
 
 /// Build a density `P = w Σ_{k<n_occ} c_k c_kᵀ` from MO coefficients (`w` = 2 for RHF, 1 for UHF).
+///
+/// Written as one `C_occ · C_occᵀ` product rather than the obvious triple loop. `Matrix` is
+/// row-major, so accumulating over MO index `k` innermost walks memory with a stride of
+/// `nao` — on a 798-AO system that is a cache miss per multiply, and profiling put this
+/// single function at 6.1 s of a 9 s single point, well ahead of the Fock build (0.6 s) and
+/// the eigendecomposition (1.3 s).
 fn density_from_coeff(c: &Matrix, n_occ: usize, weight: f64) -> Matrix {
     let nao = c.rows;
-    let mut p = Matrix::zeros(nao, nao);
+    if n_occ == 0 || nao == 0 {
+        return Matrix::zeros(nao, nao);
+    }
+    // Copy out the occupied columns so the product is over a compact block.
+    let mut occ = Matrix::zeros(nao, n_occ);
     for mu in 0..nao {
-        for nu in 0..nao {
-            let mut acc = 0.0;
-            for k in 0..n_occ {
-                acc += c[(mu, k)] * c[(nu, k)];
-            }
-            p[(mu, nu)] = weight * acc;
+        for k in 0..n_occ {
+            occ[(mu, k)] = c[(mu, k)];
+        }
+    }
+    // Transpose-free: materializing `occᵀ` is another `nao × n_occ` allocation and copy, and at
+    // 1602 AOs that is 14 MB built and thrown away on every SCF iteration.
+    let mut p = occ.matmul_transpose(&occ);
+    if weight != 1.0 {
+        for x in p.as_mut_slice() {
+            *x *= weight;
         }
     }
     p
 }
 
+/// DIIS error `[F, P] = FP − PF`.
+///
+/// Both operands are symmetric, so `PF = (FP)ᵀ` and one matrix product suffices: the second
+/// was recomputing a transpose the hard way, at O(nao³). NDDO's orthonormal AO basis is what
+/// makes this the plain commutator — there is no `S` to sandwich.
 fn commutator(f: &Matrix, p: &Matrix) -> Matrix {
-    let fp = f.matmul(p);
-    let pf = p.matmul(f);
-    let mut e = fp;
-    for (ev, pv) in e.as_mut_slice().iter_mut().zip(pf.as_slice()) {
-        *ev -= *pv;
+    let mut e = f.matmul(p);
+    let n = e.rows;
+    debug_assert_eq!(n, e.cols);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (a, b) = (e[(i, j)], e[(j, i)]);
+            e[(i, j)] = a - b;
+            e[(j, i)] = b - a;
+        }
+        e[(i, i)] = 0.0;
     }
     e
 }
@@ -343,46 +546,73 @@ fn rhf_loop(
     let mut mo_coeff = Matrix::zeros(nao, nao);
     let mut converged = false;
     let mut iterations = 0;
-    let mut diis_f: Vec<Matrix> = Vec::new();
-    let mut diis_e: Vec<Matrix> = Vec::new();
-    let mut diis_d: Vec<Matrix> = Vec::new();
+    // Packed triangles, not dense matrices: see `Tri`. At 1602 AOs the three depth-8 histories
+    // go from 492 MB to 246 MB, and to 164 MB for a CDIIS-only run, where the density history
+    // below is not built at all.
+    let mut diis_f: Vec<Vec<f64>> = Vec::new();
+    let mut diis_e: Vec<Vec<f64>> = Vec::new();
+    let mut diis_d: Vec<Vec<f64>> = Vec::new();
     let max_diis = 8;
     let accel = if options.use_diis {
         options.accelerator
     } else {
         ScfAccelerator::None
     };
+    // Only A-DIIS reads the density history. Keeping it for the other accelerators was a third
+    // of the history for nothing.
+    let needs_density_history = accel == ScfAccelerator::AdiisCdiis;
 
     for iter in 0..options.max_scf {
         iterations = iter + 1;
-        let f = build_fock(molecule, basis, params, core, &density)?;
+        let f = {
+            let _t = crate::timing::Timer::start("scf:fock");
+            build_fock(molecule, basis, params, core, &density)?
+        };
         let e_elec = 0.5 * (density.frobenius_dot(&core.h_core) + density.frobenius_dot(&f));
-        let err = commutator(&f, &density);
+        let err = {
+            let _t = crate::timing::Timer::start("scf:commutator");
+            commutator(&f, &density)
+        };
         let err_norm = err.as_slice().iter().map(|x| x * x).sum::<f64>().sqrt();
 
-        // History (Fock, commutator, density) for CDIIS / A-DIIS.
-        diis_f.push(f.clone());
-        diis_e.push(err);
-        diis_d.push(density.clone());
+        // History (Fock, commutator, density) for CDIIS / A-DIIS, packed.
+        diis_f.push(Tri::Symmetric.pack(&f));
+        diis_e.push(Tri::Antisymmetric.pack(&err));
+        if needs_density_history {
+            diis_d.push(Tri::Symmetric.pack(&density));
+        }
         if diis_f.len() > max_diis {
             diis_f.remove(0);
             diis_e.remove(0);
-            diis_d.remove(0);
+            if !diis_d.is_empty() {
+                diis_d.remove(0);
+            }
         }
 
-        let f_use = match accel {
-            ScfAccelerator::None => f,
-            ScfAccelerator::Cdiis => diis_extrapolate(&diis_f, &diis_e).unwrap_or_else(|| f.clone()),
-            ScfAccelerator::AdiisCdiis => {
-                if err_norm > options.adiis_switch {
-                    adiis_extrapolate(&diis_d, &diis_f).unwrap_or_else(|| f.clone())
-                } else {
-                    diis_extrapolate(&diis_f, &diis_e).unwrap_or_else(|| f.clone())
+        let f_use = {
+            let _t = crate::timing::Timer::start("scf:accel");
+            match accel {
+                ScfAccelerator::None => f,
+                ScfAccelerator::Cdiis => {
+                    diis_extrapolate_packed(&diis_f, &diis_e, nao).unwrap_or(f)
+                }
+                ScfAccelerator::AdiisCdiis => {
+                    if err_norm > options.adiis_switch {
+                        adiis_extrapolate_packed(&diis_d, &diis_f, nao).unwrap_or(f)
+                    } else {
+                        diis_extrapolate_packed(&diis_f, &diis_e, nao).unwrap_or(f)
+                    }
                 }
             }
         };
-        let (eps, c) = symmetric_eigen(&f_use)?;
-        let p_new = density_from_coeff(&c, n_occ, 2.0);
+        let (eps, c) = {
+            let _t = crate::timing::Timer::start("scf:eigen");
+            symmetric_eigen(&f_use)?
+        };
+        let p_new = {
+            let _t = crate::timing::Timer::start("scf:density");
+            density_from_coeff(&c, n_occ, 2.0)
+        };
         let dp = rms_diff(&p_new, &density);
         let de = (e_elec - e_old).abs();
 
@@ -396,7 +626,9 @@ fn rhf_loop(
         }
     }
     let f_final = build_fock(molecule, basis, params, core, &density)?;
-    let electronic_ev = 0.5 * (density.frobenius_dot(&core.h_core) + density.frobenius_dot(&f_final));
+    let electronic_ev = 0.5
+        * (density.frobenius_dot(&core.h_core) + density.frobenius_dot(&f_final))
+        + crate::fock::long_range_energy_term(molecule, basis, params, core, &density)?;
 
     Ok(ScfState {
         density,
@@ -404,6 +636,7 @@ fn rhf_loop(
         mo_energies,
         mo_coeff,
         n_occ,
+        beta: None,
         electronic_ev,
         converged,
         iterations,
@@ -437,12 +670,17 @@ fn uhf_loop(
     let mut e_old = 0.0;
     let mut eps_a = vec![0.0; nao];
     let mut c_a = Matrix::zeros(nao, nao);
+    let mut eps_b = vec![0.0; nao];
+    let mut c_b = Matrix::zeros(nao, nao);
     let mut converged = false;
     let mut iterations = 0;
 
-    let mut hist_fa: Vec<Matrix> = Vec::new();
-    let mut hist_fb: Vec<Matrix> = Vec::new();
-    let mut hist_err: Vec<Matrix> = Vec::new();
+    // Packed triangles, as in `rhf_loop` — see `Tri`. The error entry is the two spin
+    // commutators' strict triangles laid end to end, which preserves the Frobenius product of
+    // the stacked matrix exactly because the product of a block stack is the sum over blocks.
+    let mut hist_fa: Vec<Vec<f64>> = Vec::new();
+    let mut hist_fb: Vec<Vec<f64>> = Vec::new();
+    let mut hist_err: Vec<Vec<f64>> = Vec::new();
     let max_diis = 8;
 
     for iter in 0..options.max_scf {
@@ -455,35 +693,30 @@ fn uhf_loop(
         let fb = build_fock_spin(molecule, basis, params, core, &p_tot, &pb)?;
 
         let e_elec = 0.5
-            * (p_tot.frobenius_dot(&core.h_core)
-                + pa.frobenius_dot(&fa)
-                + pb.frobenius_dot(&fb));
+            * (p_tot.frobenius_dot(&core.h_core) + pa.frobenius_dot(&fa) + pb.frobenius_dot(&fb));
 
-        // Combined DIIS error = [F_a,P_a] ⊕ [F_b,P_b].
+        // Combined DIIS error = [F_a,P_a] ⊕ [F_b,P_b], both antisymmetric.
         let ea = commutator(&fa, &pa);
         let eb = commutator(&fb, &pb);
-        let mut err = Matrix::zeros(2 * nao, nao);
-        for i in 0..nao {
-            for j in 0..nao {
-                err[(i, j)] = ea[(i, j)];
-                err[(nao + i, j)] = eb[(i, j)];
-            }
-        }
-        let err_norm = err.as_slice().iter().map(|x| x * x).sum::<f64>().sqrt();
+        let err_norm = (ea.as_slice().iter().map(|x| x * x).sum::<f64>()
+            + eb.as_slice().iter().map(|x| x * x).sum::<f64>())
+        .sqrt();
 
         let (fa_use, fb_use) = if options.use_diis {
-            hist_fa.push(fa.clone());
-            hist_fb.push(fb.clone());
+            let mut err = Tri::Antisymmetric.pack(&ea);
+            err.extend_from_slice(&Tri::Antisymmetric.pack(&eb));
+            hist_fa.push(Tri::Symmetric.pack(&fa));
+            hist_fb.push(Tri::Symmetric.pack(&fb));
             hist_err.push(err);
             if hist_fa.len() > max_diis {
                 hist_fa.remove(0);
                 hist_fb.remove(0);
                 hist_err.remove(0);
             }
-            match diis_coeffs(&hist_err) {
+            match diis_coeffs_packed(&hist_err, nao) {
                 Some(coeffs) => (
-                    combine(&hist_fa, &coeffs),
-                    combine(&hist_fb, &coeffs),
+                    combine_packed(&hist_fa, &coeffs, Tri::Symmetric, nao),
+                    combine_packed(&hist_fb, &coeffs, Tri::Symmetric, nao),
                 ),
                 None => (fa, fb),
             }
@@ -492,7 +725,7 @@ fn uhf_loop(
         };
 
         let (ea_eps, ca) = symmetric_eigen(&fa_use)?;
-        let (_eb_eps, cb) = symmetric_eigen(&fb_use)?;
+        let (eb_eps, cb) = symmetric_eigen(&fb_use)?;
         let pa_new = density_from_coeff(&ca, n_alpha, 1.0);
         let pb_new = density_from_coeff(&cb, n_beta, 1.0);
 
@@ -500,6 +733,8 @@ fn uhf_loop(
         let de = (e_elec - e_old).abs();
         eps_a = ea_eps;
         c_a = ca;
+        eps_b = eb_eps;
+        c_b = cb;
         pa = pa_new;
         pb = pb_new;
         e_old = e_elec;
@@ -520,8 +755,9 @@ fn uhf_loop(
     // Final energy.
     let fa = build_fock_spin(molecule, basis, params, core, &density, &pa)?;
     let fb = build_fock_spin(molecule, basis, params, core, &density, &pb)?;
-    let electronic_ev =
-        0.5 * (density.frobenius_dot(&core.h_core) + pa.frobenius_dot(&fa) + pb.frobenius_dot(&fb));
+    let electronic_ev = 0.5
+        * (density.frobenius_dot(&core.h_core) + pa.frobenius_dot(&fa) + pb.frobenius_dot(&fb))
+        + crate::fock::long_range_energy_term(molecule, basis, params, core, &density)?;
 
     Ok(ScfState {
         density,
@@ -529,6 +765,11 @@ fn uhf_loop(
         mo_energies: eps_a,
         mo_coeff: c_a,
         n_occ: n_alpha,
+        beta: Some(BetaOrbitals {
+            energies: eps_b,
+            coeff: c_b,
+            n_occ: n_beta,
+        }),
         electronic_ev,
         converged,
         iterations,
@@ -536,46 +777,179 @@ fn uhf_loop(
     })
 }
 
-fn combine(fs: &[Matrix], coeffs: &[f64]) -> Matrix {
-    let (r, c) = (fs[0].rows, fs[0].cols);
-    let mut out = Matrix::zeros(r, c);
-    for (i, f) in fs.iter().enumerate() {
-        let ci = coeffs[i];
-        for (o, v) in out.as_mut_slice().iter_mut().zip(f.as_slice()) {
+/// A DIIS history entry stored as a packed triangle.
+///
+/// # Why this is not a `Vec<Matrix>`
+///
+/// `rhf_loop` keeps three depth-8 histories — Fock, commutator error, density — and at 1602 AOs
+/// (an 801-atom water cluster) twenty-four dense `nao²` matrices are **492 MB**, against a
+/// measured 877 MB peak for the whole calculation. It was the single largest term, and more than
+/// half of it was redundant: every matrix in all three histories is either symmetric or
+/// antisymmetric, so one triangle determines the other.
+///
+/// `F` and `P` are symmetric. The error `[F, P] = FP − PF` is **anti**symmetric — its transpose
+/// is `PF − FP` — so its diagonal is identically zero and only the *strict* triangle is stored.
+/// Nothing is approximated by any of this.
+///
+/// Packing halves the history exactly; gating the density history on the accelerator that
+/// actually reads it (`AdiisCdiis`) removes a third of what remains.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    /// Upper triangle including the diagonal, `n(n+1)/2` entries.
+    Symmetric,
+    /// Strict upper triangle, `n(n−1)/2` entries; the diagonal is known to be zero.
+    Antisymmetric,
+}
+
+impl Tri {
+    fn len(self, n: usize) -> usize {
+        match self {
+            Tri::Symmetric => n * (n + 1) / 2,
+            Tri::Antisymmetric => n * (n - 1) / 2,
+        }
+    }
+
+    /// Pack the upper triangle of `m` row by row.
+    fn pack(self, m: &Matrix) -> Vec<f64> {
+        let n = m.rows;
+        let mut out = Vec::with_capacity(self.len(n));
+        for i in 0..n {
+            let start = if self == Tri::Symmetric { i } else { i + 1 };
+            for j in start..n {
+                out.push(m[(i, j)]);
+            }
+        }
+        out
+    }
+
+    /// Rebuild the full matrix, mirroring with the sign this symmetry implies.
+    fn unpack(self, packed: &[f64], n: usize) -> Matrix {
+        let mut out = Matrix::zeros(n, n);
+        let mut k = 0;
+        for i in 0..n {
+            let start = if self == Tri::Symmetric { i } else { i + 1 };
+            for j in start..n {
+                let v = packed[k];
+                k += 1;
+                out[(i, j)] = v;
+                if i != j {
+                    out[(j, i)] = if self == Tri::Symmetric { v } else { -v };
+                }
+            }
+        }
+        out
+    }
+
+    /// The full-matrix Frobenius product `Σ_ij A_ij B_ij` from the packed triangles.
+    ///
+    /// Off-diagonal entries stand for two elements of the full matrix, and for an antisymmetric
+    /// pair `A_ji B_ji = (−A_ij)(−B_ij) = A_ij B_ij`, so the multiplicity is `2` in both cases.
+    /// Only the diagonal, present for `Symmetric` only, counts once.
+    fn dot(self, a: &[f64], b: &[f64], n: usize) -> f64 {
+        let mut acc = 0.0;
+        match self {
+            Tri::Antisymmetric => {
+                for (x, y) in a.iter().zip(b) {
+                    acc += x * y;
+                }
+                2.0 * acc
+            }
+            Tri::Symmetric => {
+                let mut diag = 0.0;
+                let mut k = 0;
+                for i in 0..n {
+                    diag += a[k] * b[k]; // (i, i) is first in each row
+                    k += 1;
+                    for _ in (i + 1)..n {
+                        acc += a[k] * b[k];
+                        k += 1;
+                    }
+                }
+                2.0 * acc + diag
+            }
+        }
+    }
+}
+
+/// `Σ_i c_i H_i` over packed entries, unpacked once at the end.
+fn combine_packed(history: &[Vec<f64>], coeffs: &[f64], tri: Tri, n: usize) -> Matrix {
+    let mut acc = vec![0.0; tri.len(n)];
+    for (h, ci) in history.iter().zip(coeffs) {
+        for (o, v) in acc.iter_mut().zip(h) {
             *o += ci * v;
         }
     }
-    out
+    tri.unpack(&acc, n)
 }
 
-/// Solve the Pulay DIIS coefficient system from a stack of error matrices.
-fn diis_coeffs(es: &[Matrix]) -> Option<Vec<f64>> {
-    let n = es.len();
-    if n < 2 {
+/// Pulay DIIS coefficients from packed error vectors.
+fn diis_coeffs_packed(es: &[Vec<f64>], n: usize) -> Option<Vec<f64>> {
+    let m = es.len();
+    if m < 2 {
         return None;
     }
-    let dim = n + 1;
+    let dim = m + 1;
     let mut b = Matrix::zeros(dim, dim);
-    for i in 0..n {
-        for j in 0..n {
-            b[(i, j)] = es[i].frobenius_dot(&es[j]);
+    for i in 0..m {
+        for j in 0..m {
+            b[(i, j)] = Tri::Antisymmetric.dot(&es[i], &es[j], n);
         }
-        b[(i, n)] = -1.0;
-        b[(n, i)] = -1.0;
+        b[(i, m)] = -1.0;
+        b[(m, i)] = -1.0;
     }
     let mut rhs = vec![0.0; dim];
-    rhs[n] = -1.0;
-    // The DIIS matrix (a small bordered saddle-point system) becomes singular near
-    // convergence when the error vectors turn linearly dependent. A pivot-guarded
-    // Gaussian elimination returns `None` there so the caller falls back to the plain
-    // Fock — faer's LU instead returns a degenerate solution that derails DIIS. The heavy
-    // O(n^3) eigendecomposition still uses faer; only this tiny solve is bespoke.
+    rhs[m] = -1.0;
+    // The DIIS matrix (a small bordered saddle-point system) becomes singular near convergence
+    // when the error vectors turn linearly dependent. A pivot-guarded Gaussian elimination
+    // returns `None` there so the caller falls back to the plain Fock — faer's LU instead
+    // returns a degenerate solution that derails DIIS. The heavy O(n³) eigendecomposition still
+    // uses faer; only this tiny solve is bespoke.
     solve_bordered_small(&b, &rhs)
+}
+
+/// CDIIS on packed histories: coefficients from the errors, applied to the Focks.
+fn diis_extrapolate_packed(fs: &[Vec<f64>], es: &[Vec<f64>], n: usize) -> Option<Matrix> {
+    let coeffs = diis_coeffs_packed(es, n)?;
+    Some(combine_packed(fs, &coeffs, Tri::Symmetric, n))
+}
+
+/// A-DIIS on packed histories. Same quadratic as [`adiis_extrapolate`], same expansion of the
+/// differences through the Gram matrix; only the storage differs.
+fn adiis_extrapolate_packed(
+    densities: &[Vec<f64>],
+    focks: &[Vec<f64>],
+    n: usize,
+) -> Option<Matrix> {
+    let m = densities.len();
+    if m < 2 {
+        return None;
+    }
+    use rayon::prelude::*;
+    let last = m - 1;
+    let gram: Vec<Vec<f64>> = densities
+        .par_iter()
+        .map(|di| {
+            focks
+                .iter()
+                .map(|fj| Tri::Symmetric.dot(di, fj, n))
+                .collect()
+        })
+        .collect();
+    let d: Vec<f64> = (0..m).map(|i| gram[i][last] - gram[last][last]).collect();
+    let s: Vec<Vec<f64>> = (0..m)
+        .map(|i| {
+            (0..m)
+                .map(|j| gram[i][j] - gram[i][last] - gram[last][j] + gram[last][last])
+                .collect()
+        })
+        .collect();
+    let c = solve_adiis_simplex(&d, &s);
+    Some(combine_packed(focks, &c, Tri::Symmetric, n))
 }
 
 /// Gaussian elimination with partial pivoting for the small DIIS system; returns `None`
 /// if the matrix is (near-)singular.
-fn solve_bordered_small(a: &Matrix, b: &[f64]) -> Option<Vec<f64>> {
+pub(crate) fn solve_bordered_small(a: &Matrix, b: &[f64]) -> Option<Vec<f64>> {
     let n = a.rows;
     let mut m = a.clone();
     let mut rhs = b.to_vec();
@@ -623,43 +997,6 @@ fn solve_bordered_small(a: &Matrix, b: &[f64]) -> Option<Vec<f64>> {
     Some(x)
 }
 
-fn diis_extrapolate(fs: &[Matrix], es: &[Matrix]) -> Option<Matrix> {
-    let coeffs = diis_coeffs(es)?;
-    Some(combine(fs, &coeffs))
-}
-
-fn mat_sub(a: &Matrix, b: &Matrix) -> Matrix {
-    let mut o = a.clone();
-    for (ov, bv) in o.as_mut_slice().iter_mut().zip(b.as_slice()) {
-        *ov -= *bv;
-    }
-    o
-}
-
-/// A-DIIS (Hu & Yang 2010): minimize `f(c) = 2 Σ c_i ⟨D_i−D_n|F_n⟩ + Σ c_i c_j ⟨D_i−D_n|F_j−F_n⟩`
-/// over the simplex `{c ≥ 0, Σc = 1}`, then return the extrapolated Fock `Σ c_i F_i`.
-/// Robust far from convergence (nonnegative weights prevent the runaway extrapolation that
-/// plain DIIS can produce with a poor initial guess).
-fn adiis_extrapolate(densities: &[Matrix], focks: &[Matrix]) -> Option<Matrix> {
-    let n = densities.len();
-    if n < 2 {
-        return None;
-    }
-    let dn = &densities[n - 1];
-    let fnl = &focks[n - 1];
-    let dd: Vec<Matrix> = densities.iter().map(|d| mat_sub(d, dn)).collect();
-    let ff: Vec<Matrix> = focks.iter().map(|f| mat_sub(f, fnl)).collect();
-    let d: Vec<f64> = dd.iter().map(|ddi| ddi.frobenius_dot(fnl)).collect();
-    let mut s = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            s[i][j] = dd[i].frobenius_dot(&ff[j]);
-        }
-    }
-    let c = solve_adiis_simplex(&d, &s);
-    Some(combine(focks, &c))
-}
-
 /// Projected-gradient minimization of the A-DIIS quadratic on the probability simplex.
 fn solve_adiis_simplex(d: &[f64], s: &[Vec<f64>]) -> Vec<f64> {
     let n = d.len();
@@ -701,21 +1038,25 @@ fn solve_adiis_simplex(d: &[f64], s: &[Vec<f64>]) -> Vec<f64> {
 }
 
 /// Euclidean projection of `v` onto the probability simplex `{c ≥ 0, Σc = 1}`.
+///
+/// Duchi *et al.*'s algorithm: sort descending, walk the prefix sums, and keep the threshold from
+/// the last index where `u_j` still exceeds it. That index (`ρ` in the paper) is not needed once
+/// the threshold is known, so only the threshold is carried.
 fn simplex_project(v: &[f64]) -> Vec<f64> {
     let mut u = v.to_vec();
-    u.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    // `total_cmp` rather than `partial_cmp(..).unwrap_or(Equal)`: it is a total order on every
+    // `f64` including NaN, so a NaN cannot make the sort inconsistent — which for `sort_by` is a
+    // contract violation, not merely an odd ordering.
+    u.sort_by(|a, b| b.total_cmp(a));
     let mut css = 0.0;
-    let mut rho = 0;
     let mut theta = 0.0;
     for (j, &uj) in u.iter().enumerate() {
         css += uj;
         let t = (css - 1.0) / (j as f64 + 1.0);
         if uj - t > 0.0 {
-            rho = j + 1;
             theta = t;
         }
     }
-    let _ = rho;
     v.iter().map(|&vi| (vi - theta).max(0.0)).collect()
 }
 
@@ -727,6 +1068,76 @@ mod tests {
         let mol = Molecule::from_xyz_str(xyz, charge).unwrap();
         let params = Am1Parameters::standard().unwrap();
         run_am1(&mol, &params, &Am1Options::default()).unwrap()
+    }
+
+    fn seeded(n: usize, seed: u64) -> Matrix {
+        let mut m = Matrix::zeros(n, n);
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for v in m.as_mut_slice() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5;
+        }
+        m
+    }
+
+    /// The packed DIIS history must lose nothing.
+    ///
+    /// Halving the history's memory rests on two claims: that `F` and `P` are symmetric, and
+    /// that `[F, P]` is antisymmetric *with a zero diagonal* — the packing drops that diagonal
+    /// outright, so if `commutator` ever stopped zeroing it (`scf.rs`'s `e[(i, i)] = 0.0`) the
+    /// DIIS error would silently lose a term. This checks the round trip and the Frobenius
+    /// product against the dense original, which is what the extrapolation actually consumes.
+    #[test]
+    fn packing_a_diis_history_preserves_it_exactly() {
+        let n = 9;
+        // Symmetric operands, as F and P are.
+        let raw = seeded(n, 5);
+        let mut f = Matrix::zeros(n, n);
+        let mut p = Matrix::zeros(n, n);
+        let raw2 = seeded(n, 9);
+        for i in 0..n {
+            for j in 0..n {
+                f[(i, j)] = raw[(i, j)] + raw[(j, i)];
+                p[(i, j)] = raw2[(i, j)] + raw2[(j, i)];
+            }
+        }
+
+        for m in [&f, &p] {
+            let packed = Tri::Symmetric.pack(m);
+            assert_eq!(packed.len(), Tri::Symmetric.len(n));
+            let back = Tri::Symmetric.unpack(&packed, n);
+            assert_eq!(&back, m, "symmetric round trip");
+        }
+
+        let e1 = commutator(&f, &p);
+        let e2 = commutator(&p, &f);
+        for e in [&e1, &e2] {
+            for i in 0..n {
+                assert_eq!(e[(i, i)], 0.0, "the commutator diagonal must be zero");
+            }
+            let packed = Tri::Antisymmetric.pack(e);
+            assert_eq!(packed.len(), Tri::Antisymmetric.len(n));
+            assert_eq!(&Tri::Antisymmetric.unpack(&packed, n), e, "anti round trip");
+        }
+
+        // The quantity DIIS actually forms: <e_i, e_j> and <D_i, F_j> over the full matrices.
+        let (pe1, pe2) = (Tri::Antisymmetric.pack(&e1), Tri::Antisymmetric.pack(&e2));
+        let want = e1.frobenius_dot(&e2);
+        let got = Tri::Antisymmetric.dot(&pe1, &pe2, n);
+        assert!(
+            (want - got).abs() < 1.0e-12 * want.abs().max(1.0),
+            "antisymmetric Frobenius product {got} against {want}"
+        );
+
+        let (pf, pp) = (Tri::Symmetric.pack(&f), Tri::Symmetric.pack(&p));
+        let want = f.frobenius_dot(&p);
+        let got = Tri::Symmetric.dot(&pf, &pp, n);
+        assert!(
+            (want - got).abs() < 1.0e-12 * want.abs().max(1.0),
+            "symmetric Frobenius product {got} against {want}"
+        );
     }
 
     fn run_mult(xyz: &str, charge: f64, mult: usize) -> Am1Result {
@@ -742,7 +1153,8 @@ mod tests {
 
     #[test]
     fn water_heat_of_formation() {
-        let xyz = "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
+        let xyz =
+            "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
         let r = run(xyz, 0.0);
         eprintln!(
             "H2O: dHf={:.3} kcal/mol  elec={:.4} eV core={:.4} eV  dipole={:.3} D  charges={:?}  iters={}",
@@ -758,7 +1170,8 @@ mod tests {
 
     #[test]
     fn water_no_diis_debug() {
-        let xyz = "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
+        let xyz =
+            "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
         let mol = Molecule::from_xyz_str(xyz, 0.0).unwrap();
         let params = Am1Parameters::standard().unwrap();
         let opts = Am1Options {
@@ -777,7 +1190,10 @@ mod tests {
     fn methane_heat_of_formation() {
         let xyz = "5\nmethane\nC 0.0000 0.0000 0.0000\nH 0.6276 0.6276 0.6276\nH -0.6276 -0.6276 0.6276\nH -0.6276 0.6276 -0.6276\nH 0.6276 -0.6276 -0.6276\n";
         let r = run(xyz, 0.0);
-        eprintln!("CH4: dHf={:.3} kcal/mol dipole={:.3} D iters={}", r.heat_of_formation_kcal, r.dipole_magnitude, r.iterations);
+        eprintln!(
+            "CH4: dHf={:.3} kcal/mol dipole={:.3} D iters={}",
+            r.heat_of_formation_kcal, r.dipole_magnitude, r.iterations
+        );
         assert!(r.converged);
     }
 
@@ -785,7 +1201,8 @@ mod tests {
     fn accelerators_agree_on_energy() {
         // A-DIIS→CDIIS, plain CDIIS, and no acceleration must reach the same converged
         // energy (same SCF fixed point); the hybrid should not need more iterations.
-        let xyz = "4\nformaldehyde\nC 0.0 0.0 0.0\nO 0.0 0.0 1.21\nH 0.94 0.0 -0.54\nH -0.94 0.0 -0.54\n";
+        let xyz =
+            "4\nformaldehyde\nC 0.0 0.0 0.0\nO 0.0 0.0 1.21\nH 0.94 0.0 -0.54\nH -0.94 0.0 -0.54\n";
         let mol = Molecule::from_xyz_str(xyz, 0.0).unwrap();
         let params = Am1Parameters::standard().unwrap();
         let run = |acc: ScfAccelerator| {
@@ -831,19 +1248,26 @@ mod tests {
     fn forced_uhf_singlet_matches_rhf() {
         // A closed-shell singlet run as UHF must take the unrestricted path yet converge to the
         // RHF energy (a symmetric guess yields zero spin density).
-        let xyz = "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
+        let xyz =
+            "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
         let mol = Molecule::from_xyz_str(xyz, 0.0).unwrap();
         let params = Am1Parameters::standard().unwrap();
         let rhf = run_am1(&mol, &params, &Am1Options::default()).unwrap();
         let uhf = run_am1(
             &mol,
             &params,
-            &Am1Options { reference: ScfReference::Unrestricted, ..Am1Options::default() },
+            &Am1Options {
+                reference: ScfReference::Unrestricted,
+                ..Am1Options::default()
+            },
         )
         .unwrap();
         assert!(!rhf.unrestricted);
         assert!(uhf.unrestricted, "forced reference did not select UHF");
-        assert!((rhf.total_ev - uhf.total_ev).abs() < 1e-6, "UHF singlet != RHF energy");
+        assert!(
+            (rhf.total_ev - uhf.total_ev).abs() < 1e-6,
+            "UHF singlet != RHF energy"
+        );
         // Net spin of a (symmetric) singlet must be ≈ 0.
         let spin = uhf.spin_density.as_ref().unwrap();
         let n_spin: f64 = (0..spin.rows).map(|i| spin[(i, i)]).sum();
@@ -853,14 +1277,18 @@ mod tests {
     #[test]
     fn forced_rhf_singlet_matches_auto() {
         // Explicitly restricting a closed shell is identical to Auto.
-        let xyz = "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
+        let xyz =
+            "3\nwater\nO 0.0000 0.0000 0.0000\nH 0.9584 0.0000 0.0000\nH -0.2400 0.9278 0.0000\n";
         let mol = Molecule::from_xyz_str(xyz, 0.0).unwrap();
         let params = Am1Parameters::standard().unwrap();
         let auto = run_am1(&mol, &params, &Am1Options::default()).unwrap();
         let rhf = run_am1(
             &mol,
             &params,
-            &Am1Options { reference: ScfReference::Restricted, ..Am1Options::default() },
+            &Am1Options {
+                reference: ScfReference::Restricted,
+                ..Am1Options::default()
+            },
         )
         .unwrap();
         assert!(!rhf.unrestricted);
@@ -882,6 +1310,9 @@ mod tests {
                 ..Am1Options::default()
             },
         );
-        assert!(res.is_err(), "restricted open-shell request should be rejected");
+        assert!(
+            res.is_err(),
+            "restricted open-shell request should be rejected"
+        );
     }
 }

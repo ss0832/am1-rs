@@ -172,7 +172,65 @@ for f in &vib.frequencies_cm { /* cm⁻¹, ascending; negatives = imaginary */ }
 let h = numerical_hessian(&mol, &params, &opts, 1.0e-3)?;
 ```
 
-`VibrationalModes { hessian: Matrix, frequencies_cm: Vec<f64>, eigenvalues: Vec<f64> }`.
+`VibrationalModes` also carries `modes` (mass-weighted eigenvectors, columns are modes and are
+orthonormal), `cartesian_displacements` (`M^{−1/2}L`, deliberately not renormalized) and
+`translation_rotation_overlap` — each mode's share of rigid-body motion, so a linear molecule's
+five rigid-body modes are discovered from the eigenvectors rather than assumed from `3N − 6`.
+
+`analytic_hessian_with_response` returns the CPHF solution the Hessian was built from instead of
+discarding it:
+
+```rust
+let r: HessianResponse = analytic_hessian_with_response(&mol, &params, &opts, 1.0e-3)?;
+r.hessian;                    // the same matrix `analytic_hessian` returns
+r.alpha.u_ov[dof];            // n_vir × n_occ CPHF block for one Cartesian perturbation
+r.response_density(dof);      // ∂P/∂R_j in the AO basis, built on demand
+r.beta;                       // Some(..) for an unrestricted run
+```
+
+The response densities are built on demand rather than stored: all `3N` at once is the largest
+array in the calculation and is almost never wanted whole.
+
+## 6b. External electric field
+
+```rust
+let opts = Am1Options {
+    // eV per (e·Bohr) — the crate's internal unit.
+    electric_field: Some(Vec3::new(0.0, 0.0, 0.136)),
+    ..Am1Options::default()
+};
+let g = closed_form_gradient(&mol, &params, &opts)?;   // force on atom a gains +Q_a F
+let h = analytic_hessian(&mol, &params, &opts, 1.0e-3)?;
+```
+
+`E(F) = E₀ − μ·F`. `src/dipole.rs` holds the operator and the one sign convention every consumer
+shares; `Am1Result::field_nuclear_ev` reports the nuclear half, the electronic half already being
+inside `electronic_ev`. Under a cell the field must be **orthogonal to every lattice vector** (normal to a slab, transverse to a chain); a component along a periodic direction is an error naming itself, because `F·R` is unbounded there. `PbcOptions::electric_field` is the periodic counterpart. Refused for any cell before 0.2.2.
+
+## 6c. Infrared intensities and the atomic polar tensor
+
+```rust
+let apt = am1_rs::ir::dipole_derivatives(&mol, &params, &opts)?;   // 3 × 3N, units of e
+let s: IrSpectrum = am1_rs::ir::ir_spectrum(&mol, &params, &opts)?;
+s.intensities_km_per_mol;
+s.mode_dipole_derivatives;              // dense per-mode tensor, keeps the dipole direction
+s.vibrational_bands(0.5);               // (index, cm⁻¹, km/mol) for the non-rigid-body modes
+```
+
+Both run an analytic Hessian; `ir_spectrum` reuses the one CPHF solve for the tensor and the
+modes. `Σ_a ∂μ_α/∂R_{a,β} = q δ_αβ` is the sum rule that checks it.
+
+## 6d. Wavefunction output
+
+```rust
+let scf = run_am1(&mol, &params, &opts)?;
+let text = am1_rs::molden::to_molden(&mol, &params, &scf)?;
+am1_rs::molden::write_molden("water.molden", &mol, &params, &scf)?;
+```
+
+`Am1Result` carries `mo_energies`, `mo_coeff`, `n_occ` and — for an unrestricted run — `beta`,
+which UHF used to solve for and discard. See [theory.md](theory.md) for why the coefficients are
+in an implicitly orthogonalized basis.
 
 ## 7. AM1-BCC partial charges (AMBER)
 
@@ -187,11 +245,137 @@ am1_rs::bcc::write_mol2("out.mol2", &mol, &bcc)?;    // Tripos MOL2 with the cha
 
 `BccResult { charges: Vec<f64>, atom_types: Vec<String>, mulliken: Vec<f64> }`.
 
-## 8. Errors
+## 8. Methods: AM1 and RM1
+
+```rust
+use am1_rs::{Am1Parameters, NddoMethod};
+
+let am1 = Am1Parameters::standard()?;                       // AM1, 21 elements
+let rm1 = Am1Parameters::for_method(NddoMethod::Rm1)?;      // RM1, 10 elements
+```
+
+The method travels with the parameter set, so every downstream path — gradients, Hessians,
+periodic boundary conditions, divide-and-conquer — follows from the one argument. See
+[methods.md](methods.md).
+
+## 9. Periodic boundary conditions
+
+```rust
+use am1_rs::{Lattice, Molecule, Vec3, KMesh, PbcOptions, run_pbc_scf, pbc_energy_and_gradient};
+
+// Lattice vectors are in BOHR here (the Rust surface's unit), not Ångström.
+let crystal = mol.with_cell(Lattice::from_vectors(
+    Vec3::new(a, 0.0, 0.0),
+    Vec3::new(0.0, b, 0.0),
+    Vec3::new(0.0, 0.0, c),
+    [true, true, false],            // a slab; [true, true, true] for a crystal
+)?);
+
+let opts = PbcOptions {
+    kmesh: KMesh::MonkhorstPack([4, 4, 1]),
+    exchange_cutoff: Some(12.0),
+    smearing_ev: 0.0,
+    ..PbcOptions::default()
+};
+
+let scf = run_pbc_scf(&crystal, &params, &opts)?;
+println!("{} eV per cell, {} k-points", scf.total_ev, scf.k_points);
+if let Some(w) = &scf.charged_cell_warning { eprintln!("{w}"); }
+
+let (scf, grad) = pbc_energy_and_gradient(&crystal, &params, &opts)?;
+println!("stress (Voigt) = {:?}", grad.stress_voigt());   // eV/Bohr^d
+```
+
+`PbcResult` carries `total_ev`, `band_energy_ev`, `fermi_energy_ev`, `entropy_ev`, `charges`,
+`density` / `spin_density` as `RealSpaceBlocks`, `k_points`, `max_image_overlap` and
+`charged_cell_warning`, with `free_energy_ev()` and `extrapolated_energy_ev()`.
+`PbcGradient` carries `gradient`, `forces`, `stress`, `stress_voigt()` and `pressure(d)`.
+
+### Periodic response properties
+
+```rust
+use am1_rs::pbc::{pbc_hessian, born_charges, dielectric_tensor};
+use am1_rs::pbc::{dielectric_tensor_with_extent, ExtentConvention};
+use am1_rs::pbc::{frequencies_dfpt_with, DfptOptions, LongRange, KPoint};
+
+// q = 0 force constants with k-point sampling — no exchange taper standing in for physics.
+let h = pbc_hessian(&crystal, &params, &opts)?;
+
+let z = born_charges(&crystal, &params, &opts)?;             // Z*, Σ_a Z*_a = 0
+let (alpha, epsilon) = dielectric_tensor(&crystal, &params, &opts)?;   // 3D cells only
+
+// Below three dimensions the volume is not the cell's, so it is named rather than assumed. The
+// conversion carries the depolarization factor that goes with the body you just declared, so a
+// slab's out-of-plane law is `1/(1 − 4πχ)` and not `1 + 4πχ`.
+let (alpha, epsilon) = dielectric_tensor_with_extent(
+    &slab, &params, &opts, ExtentConvention::SlabThickness(6.0),   // Bohr
+)?;
+
+// Phonons at any q, no supercell. On a 3D cell this is the *full* D(q) — the long-range
+// monopole channel is inside it — so do NOT also apply `frequencies_with_lo_to`, which exists
+// to give that same physics to the supercell route. Use one route or the other, never both.
+let q = KPoint { fractional: [0.25, 0.0, 0.0], weight: 1.0 };
+let nu = frequencies_dfpt_with(&crystal, &params, &opts, &DfptOptions {
+    long_range: LongRange::Auto,
+    ..DfptOptions::default()
+}, q)?;
+
+// The other route: supercell force constants plus the non-analytic term from `z` and `epsilon`.
+// `direction` is the unit vector along which the q -> 0 limit is taken; the limit is direction
+// dependent, which is what LO-TO splitting *is*.
+use am1_rs::pbc::ForceConstants;
+let volume = crystal.cell.unwrap().measure();
+let direction = am1_rs::math::Vec3::new(1.0, 0.0, 0.0);
+let fc = ForceConstants::from_supercell(&crystal, &params, &scf_opts, [2, 2, 2])?;
+let split = fc.frequencies_with_lo_to(q, direction, &z, &epsilon, volume)?;
+```
+
+`DfptOptions` also takes an arbitrary `kmesh` or an explicit `kpoints` list — and the ground state
+is solved on that same set, because the response equations assume the zeroth order satisfies the
+SCF condition. `force_constants_at_q_with` returns a `DfptResult` carrying the band energies,
+occupations and (with `keep_response`) the `(k, k+q)` first-order densities.
+
+`keep_response` is off by default and it is worth knowing why: the solver **streams** the
+perturbations — solve, contract into `C(q)`, drop — so the response never exists all at once
+unless you ask for it. Setting the flag is what builds the `O(3N · n_k · nao²)` array, not what
+returns one that was already there.
+
+`DfptResult` also carries `bare_nonzeros` and `bare_dense_elements`, the entries the contraction
+actually touches per `(j, j', k)` against the `nao²` a dense bare perturbation would force. They
+are returned for the same reason `DcResult` returns its operation counters: assembling `C(q)` is
+claimed to be `O(N³ n_k)` rather than `O(N⁴ n_k)`, and a claim about scaling should be checkable
+from the result.
+
+Read [pbc.md](pbc.md) for the conventions and the limitations.
+
+## 10. Divide-and-conquer
+
+```rust
+use am1_rs::{run_divide_conquer, divide_conquer_gradient, DcOptions};
+use am1_rs::fermi::Filling;
+
+let dc = run_divide_conquer(&mol, &params, &opts, &DcOptions {
+    core_size: 12,
+    buffer_radius: 11.0,
+    filling: Filling::Fermi { kt: 0.05 },
+    ..DcOptions::default()
+})?;
+println!("{} eV in {} subsystems (largest {} AOs)",
+         dc.total_ev, dc.subsystems, dc.largest_subsystem_aos);
+if let Some(w) = &dc.small_gap_warning { eprintln!("{w}"); }
+
+let gradient = divide_conquer_gradient(&mol, &params, &dc)?;
+```
+
+`partition_atoms`, `build_subsystems` and `partition_weight_sum` are public so the partition and
+its sum rule can be inspected directly. See [divide-conquer.md](divide-conquer.md).
+
+## 11. Errors
 
 Every fallible call returns `am1_rs::Result<T>` (= `Result<T, Am1Error>`). Variants include
 `Io`, `Parse`, `InvalidInput`, `MissingElement(u8)`, `MissingParameter(String)`,
-`LinearAlgebra(String)`, and `ScfNotConverged { iterations, error }`.
+`LinearAlgebra(String)`, `ScfNotConverged { iterations, error }`, `CphfNotConverged` and
+`ElementNotParameterized`.
 
 ## End-to-end example
 

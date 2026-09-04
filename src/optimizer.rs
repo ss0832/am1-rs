@@ -238,7 +238,13 @@ mod tests {
         let xyz = "3\nwater\nO 0.0 0.0 0.0\nH 1.05 0.0 0.0\nH -0.30 1.02 0.0\n";
         let mol = Molecule::from_xyz_str(xyz, 0.0).unwrap();
         let params = Am1Parameters::standard().unwrap();
-        let res = optimize(&mol, &params, &Am1Options::default(), &OptOptions::default()).unwrap();
+        let res = optimize(
+            &mol,
+            &params,
+            &Am1Options::default(),
+            &OptOptions::default(),
+        )
+        .unwrap();
         eprintln!(
             "opt H2O: converged={} iters={} dHf={:.3} kcal/mol maxgrad={:.2e}",
             res.converged,

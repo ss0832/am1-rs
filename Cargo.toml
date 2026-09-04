@@ -1,11 +1,26 @@
 [package]
 name = "am1-rs"
-version = "0.1.3"
+version = "0.2.2"
 edition = "2021"
+# The MSRV is checked in CI. It is set by `let`-else and the 2021 edition, not by anything
+# exotic; raising it should be a deliberate decision, not a side effect of an edit.
+rust-version = "1.75"
 license = "GPL-3.0-or-later"
 authors = ["ss0832"]
-description = "Rust-native AM1 (Austin Model 1) semiempirical NDDO method: heats of formation, Mulliken and AM1-BCC charges, analytic gradients and L-BFGS geometry optimization, with Rust, Python-native and ASE APIs."
+description = "Rust-native AM1-family semiempirical NDDO methods (AM1, RM1): heats of formation, Mulliken and AM1-BCC charges, analytic gradients, CPHF Hessians, infrared spectra, external electric fields, Molden wavefunction output, periodic boundary conditions with k-points, analytic stress and DFPT phonons, and L-BFGS optimization, with Rust, Python-native and ASE APIs."
+repository = "https://github.com/ss0832/am1-rs"
+homepage = "https://github.com/ss0832/am1-rs"
+documentation = "https://docs.rs/am1-rs"
+readme = "README.md"
+keywords = ["chemistry", "semiempirical", "quantum", "am1", "nddo"]
+categories = ["science", "simulation"]
+exclude = ["/.github", "/tools", "/examples/*.png", "*.zip"]
 autobins = false
+
+[package.metadata.docs.rs]
+# docs.rs must not try to link libpython, so document the Rust surface only.
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "am1_rs"
@@ -30,8 +45,28 @@ codegen-units = 1
 [dependencies]
 faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }
 rayon = "1.10"
-pyo3 = { version = "0.23.5", optional = true, features = ["extension-module", "abi3-py39"] }
+# `erf`/`erfc` are not in Rust's std. libm is the musl/FreeBSD msun port, sub-ulp accurate
+# over the whole double range, and already in the dependency graph through faer. Accuracy
+# here is not cosmetic: it sets how far the periodic Ewald result can be independent of the
+# splitting parameter, which is the acceptance test for that code.
+libm = "0.2"
+pyo3 = { version = "0.23.5", optional = true, features = ["abi3-py311"] }
 
 [features]
 default = []
+# `python` builds the bindings but links against libpython, so `cargo test --features python`
+# and the CLI still work. `extension-module` adds pyo3's flag that leaves the Python symbols
+# undefined, which is required for a shared library loaded *into* an interpreter and which
+# breaks a normal executable link on Linux and macOS. maturin turns it on; nothing else should.
 python = ["pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
+
+# Fast-iteration profile: same codegen semantics as `release` (no debug assertions,
+# optimized) but without fat LTO and with parallel codegen units, so an edit-test cycle
+# links in seconds instead of minutes. Use `cargo test --profile fast` while developing;
+# ship and benchmark with `--release`.
+[profile.fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16

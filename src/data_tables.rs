@@ -17,6 +17,11 @@
 /// Raw AM1 parameter table, parsed from the embedded MOPAC CSV.
 pub const AM1_PARAM_CSV: &str = include_str!("data/am1_parameters.csv");
 
+/// Raw RM1 parameter table (Rocha, Freire, Simas & Stewart 2006), extracted from MOPAC's
+/// Fortran tabulation by `tools/extract_rm1_parameters.py`. Same schema and same functional
+/// form as AM1; see the CSV header and `THIRD_PARTY_NOTICES.md` for provenance.
+pub const RM1_PARAM_CSV: &str = include_str!("data/rm1_parameters.csv");
+
 /// Valence-shell principal quantum number `n` per Z (0 for unsupported).
 pub const QN: [u8; 87] = [
     0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,

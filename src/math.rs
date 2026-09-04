@@ -133,4 +133,30 @@ impl Mat3 {
     pub fn mul_vec(self, v: Vec3) -> Vec3 {
         self.col[0] * v.x + self.col[1] * v.y + self.col[2] * v.z
     }
+    /// Signed determinant. For a lattice this is the cell volume, positive for a
+    /// right-handed basis.
+    #[inline]
+    pub fn determinant(self) -> f64 {
+        self.col[0].dot(self.col[1].cross(self.col[2]))
+    }
+    /// Rows of the inverse, i.e. the reciprocal basis without the `2π`. Row `i` dotted into a
+    /// Cartesian vector gives its `i`-th fractional coordinate. `None` if the matrix is
+    /// singular within `eps`.
+    pub fn inverse_rows(self, eps: f64) -> Option<[Vec3; 3]> {
+        let det = self.determinant();
+        if det.abs() < eps {
+            return None;
+        }
+        let (a, b, c) = (self.col[0], self.col[1], self.col[2]);
+        Some([b.cross(c) / det, c.cross(a) / det, a.cross(b) / det])
+    }
+    #[inline]
+    pub fn transpose(self) -> Self {
+        let [a, b, c] = self.col;
+        Self::from_columns(
+            Vec3::new(a.x, b.x, c.x),
+            Vec3::new(a.y, b.y, c.y),
+            Vec3::new(a.z, b.z, c.z),
+        )
+    }
 }
