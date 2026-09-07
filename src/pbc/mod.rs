@@ -32,7 +32,9 @@ pub mod extent;
 pub mod finite_field;
 pub mod gradient;
 pub mod hessian;
+pub(crate) mod kerker;
 pub mod kpoints;
+pub mod optimizer;
 pub mod phonon;
 pub mod scf;
 
@@ -59,5 +61,23 @@ pub use hessian::{
     pbc_hessian, pbc_hessian_skeleton, polarizability, PhononResponse,
 };
 pub use kpoints::{all_real, KMesh, KPoint};
+pub use optimizer::{optimize_periodic, PbcOptOptions, PbcOptResult, PbcOptStep};
 pub use phonon::{build_supercell, q_path, ForceConstants};
 pub use scf::{run_pbc_scf, PbcOptions, PbcResult, RealSpaceBlocks};
+
+/// How far an occupation may sit from an integer before a response calculation refuses it.
+///
+/// # Why this is a constant and not an option
+///
+/// It is not a tolerance in the usual sense — a knob trading accuracy for cost — but the exact
+/// point at which the surrounding code stops being able to represent the level. `hessian.rs`
+/// classifies a band as occupied when it holds more than `full − 1e-6` electrons and as virtual
+/// when it holds less than `1e-6`, and **a band between those is in neither list**: it is dropped
+/// from the response, contributing nothing. Choosing a looser threshold here would not make such
+/// a band representable, it would only make the dropping quiet again.
+///
+/// So the check is exactly "the set of bands the response cannot represent is non-empty", and
+/// changing the number would break that identity. [`PbcOptions::require_integer_occupations`] is
+/// the way out, and it is a yes/no because the choice is between an error and a known-wrong
+/// number, not between two accuracies.
+pub const INTEGER_OCCUPATION_TOL: f64 = 1.0e-6;

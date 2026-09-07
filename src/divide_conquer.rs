@@ -96,11 +96,20 @@ pub struct DcOptions {
 
 impl Default for DcOptions {
     fn default() -> Self {
+        // These are the numbers **every** front end uses: `native.divide_conquer`'s signature,
+        // the ASE calculator's parameter dict and the CLI's `--dc` all resolve to them.
+        //
+        // They used to be a fourth, different set — `core_size: 8`, `buffer_radius: 12.0`,
+        // `kt = 0.1`, `max_scf: 200` — while the Python surface defaulted to 12 / 11.0 / 0.05.
+        // Nothing failed, because every test passed its own values; what it produced was two
+        // command lines that ran different calculations. `am1_rs_cli energy --dc` and
+        // `python -m am1_rs energy --dc` on the same file reported Fermi energies of −0.0485 and
+        // −0.0945 Hartree, which is the sort of disagreement that reads as a bug in one of them.
         Self {
-            core_size: 8,
-            buffer_radius: 12.0,
-            filling: Filling::Fermi { kt: 0.1 },
-            max_scf: 200,
+            core_size: 12,
+            buffer_radius: 11.0,
+            filling: Filling::Fermi { kt: 0.05 },
+            max_scf: 300,
             e_tol: 1.0e-7,
             p_tol: 1.0e-6,
             mixing: 0.4,
@@ -1502,6 +1511,155 @@ pub fn divide_conquer_gradient(
         &mut gradient,
     )?;
     Ok(gradient)
+}
+
+/// One step of a divide-and-conquer relaxation.
+#[derive(Clone, Debug)]
+pub struct DcOptStep {
+    pub energy_ev: f64,
+    pub heat_of_formation_kcal: f64,
+    pub max_gradient: f64,
+    pub positions: Vec<Vec3>,
+}
+
+/// What a divide-and-conquer relaxation produced.
+///
+/// Separate from [`crate::optimizer::OptResult`] because the two carry different results:
+/// `OptResult` holds an [`crate::Am1Result`] and this holds a [`DcResult`], which reports the
+/// subsystem count, the operation counters and the small-gap warning that a full SCF has no
+/// notion of. Making one type serve both would mean dropping whichever half the caller wanted.
+#[derive(Clone, Debug)]
+pub struct DcOptResult {
+    pub molecule: Molecule,
+    pub dc: DcResult,
+    pub converged: bool,
+    pub iterations: usize,
+    pub trajectory: Vec<DcOptStep>,
+}
+
+/// Relax a geometry with the divide-and-conquer SCF supplying every energy and gradient.
+///
+/// # Why this is its own driver rather than a flag on `optimize`
+///
+/// The quasi-Newton step is shared — this uses [`crate::optimizer::Lbfgs`], the same memory and
+/// the same two guards as the molecular and periodic relaxations, so there is one implementation
+/// of the recursion in the crate and not three. What is not shared is the *result*: the loop has
+/// to carry a `DcResult` through, and the two result types have no useful supertype. This is the
+/// same split [`crate::pbc::optimizer`] made, for the same reason.
+///
+/// # The line search accepts the divide-and-conquer energy
+///
+/// Not the full-SCF energy at the same geometry. `E_dc` is what `divide_conquer_gradient`
+/// differentiates, so it is the function whose stationary point this is looking for; testing the
+/// Armijo condition against a different functional would leave the search accepting steps that do
+/// not decrease the thing being minimized. The two agree to the buffer's accuracy, which is
+/// exactly the size of error that a line search notices and an energy report does not.
+///
+/// # Fermi smearing and the free energy
+///
+/// Subsystem levels are filled against a common chemical potential with a finite `kt`
+/// ([`DcOptions::filling`]), so the quantity that is variational is the free energy `E − TS`, not
+/// `E`, and that is what the line search descends here.
+///
+/// Whether the analytic force differentiates `E` or `E − TS` is **not settled by measurement**.
+/// `tests/dc_optimize.rs` finite-differences both on a water trimer and gets the same number to
+/// eight digits, because a 16 eV gap at `kt = 0.1 eV` leaves the entropy identically zero — so
+/// the test pins the force's accuracy and cannot distinguish the two. The free energy is the
+/// safe choice of the two: it is the functional a finite-temperature ensemble minimizes, so on a
+/// system where they *do* differ it is the one the search should be following. A partially
+/// occupied system would settle it, and there is no such test yet.
+pub fn optimize_divide_conquer(
+    molecule: &Molecule,
+    params: &Am1Parameters,
+    scf_options: &Am1Options,
+    dc_options: &DcOptions,
+    opt: &crate::optimizer::OptOptions,
+) -> Result<DcOptResult> {
+    use crate::optimizer::{axpy, dot, flatten, flatten_grad, set_positions, unflatten, Lbfgs};
+
+    let ndof = 3 * molecule.atoms.len();
+    let mut mol = molecule.clone();
+
+    // Energy, gradient and the result object, at the current geometry.
+    let evaluate = |m: &Molecule| -> Result<(DcResult, Vec<f64>, f64)> {
+        let dc = run_divide_conquer(m, params, scf_options, dc_options)?;
+        let g = divide_conquer_gradient(m, params, scf_options, &dc)?;
+        let max = g.iter().fold(0.0_f64, |acc, v| {
+            acc.max(v.x.abs()).max(v.y.abs()).max(v.z.abs())
+        });
+        Ok((dc, flatten_grad(&g), max))
+    };
+
+    let mut x = flatten(&mol);
+    let (mut dc, mut g, mut max_grad) = evaluate(&mol)?;
+    let mut energy = dc.free_energy_ev();
+    let mut memory = Lbfgs::new(opt.history);
+    let mut trajectory = vec![DcOptStep {
+        energy_ev: dc.total_ev,
+        heat_of_formation_kcal: dc.heat_of_formation_kcal,
+        max_gradient: max_grad,
+        positions: unflatten(&x),
+    }];
+    let mut converged = max_grad < opt.gtol;
+    let mut iterations = 0;
+
+    for iter in 0..opt.max_iter {
+        iterations = iter + 1;
+        if converged {
+            break;
+        }
+        let d = memory.direction(&g, max_grad);
+        let g_dot_d = dot(&g, &d);
+        let mut step = 1.0;
+        let c1 = 1.0e-4;
+        let mut x_new;
+        let mut ok = false;
+        loop {
+            x_new = x.clone();
+            axpy(&mut x_new, step, &d);
+            set_positions(&mut mol, &x_new);
+            if let Ok(r) = run_divide_conquer(&mol, params, scf_options, dc_options) {
+                if r.free_energy_ev() <= energy + c1 * step * g_dot_d {
+                    ok = true;
+                    break;
+                }
+            }
+            step *= 0.5;
+            if step < 1.0e-8 {
+                break;
+            }
+        }
+        if !ok {
+            set_positions(&mut mol, &x);
+            break;
+        }
+        let (dc_new, g_new, max_new) = evaluate(&mol)?;
+        memory.push(
+            (0..ndof).map(|i| x_new[i] - x[i]).collect(),
+            (0..ndof).map(|i| g_new[i] - g[i]).collect(),
+        );
+        x = x_new;
+        g = g_new;
+        energy = dc_new.free_energy_ev();
+        max_grad = max_new;
+        dc = dc_new;
+        converged = max_grad < opt.gtol;
+        trajectory.push(DcOptStep {
+            energy_ev: dc.total_ev,
+            heat_of_formation_kcal: dc.heat_of_formation_kcal,
+            max_gradient: max_grad,
+            positions: unflatten(&x),
+        });
+    }
+
+    set_positions(&mut mol, &x);
+    Ok(DcOptResult {
+        molecule: mol,
+        dc,
+        converged,
+        iterations,
+        trajectory,
+    })
 }
 
 #[cfg(test)]

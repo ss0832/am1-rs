@@ -5,7 +5,7 @@ crate root (all the main types are re-exported there):
 
 ```toml
 [dependencies]
-am1-rs = "0.1"
+am1-rs = "0.2"
 ```
 
 ```rust
@@ -28,7 +28,24 @@ use am1_rs::{
     // errors / linalg
     Am1Error, Result, Matrix,
 };
+
+// Periodic boundary conditions, including relaxation of the atoms and the lattice.
+use am1_rs::pbc::{
+    run_pbc_scf, pbc_gradient, pbc_energy_and_gradient, PbcOptions, PbcResult, KMesh, KPoint,
+    optimize_periodic, PbcOptOptions, PbcOptResult,
+    phonon::ForceConstants, dynamical_matrix_dfpt, frequencies_dfpt, DfptOptions,
+};
+// Wavefunction output, and the Gaussian expansion its `[GTO]` section is built from.
+use am1_rs::molden::{to_molden, to_molden_with, MoldenOptions, MoldenBasis};
+use am1_rs::gto::expand_slater;
 ```
+
+**New in 0.2.3.** `pbc::optimize_periodic` relaxes a periodic structure — atoms against the
+k-point forces, and with `PbcOptOptions::relax_cell` the lattice against the analytic stress.
+`vibrational_analysis` returns `3N − rigid_body_count` **vibrations** rather than the full `3N`
+spectrum, with the rigid-body subspace projected out; the unprojected spectrum is still available
+as `VibrationalModes::all_frequencies_cm`, and `hessian`/`analytic_hessian` are untouched — they
+return the raw Cartesian second-derivative matrix as they always have.
 
 ## Units
 
@@ -346,6 +363,45 @@ are returned for the same reason `DcResult` returns its operation counters: asse
 claimed to be `O(N³ n_k)` rather than `O(N⁴ n_k)`, and a claim about scaling should be checkable
 from the result.
 
+### Fractional occupations are refused
+
+Every response above is derived at fixed integer occupation: there is no `∂f/∂ε` term in the
+coupled-perturbed equations, so a partially filled band is a term they do not have rather than a
+small error. Since 0.2.3 they return `Am1Error::FractionalOccupation`, naming the k-point, the
+band, the occupation and the smearing, instead of the plausible wrong number 0.2.2 gave.
+
+```rust
+match pbc_hessian(&crystal, &params, &opts) {
+    Err(Am1Error::FractionalOccupation { k_index, level, occupation, .. }) => { /* … */ }
+    other => other?,
+};
+```
+
+`PbcOptions::require_integer_occupations = false` restores the old path. It is a boolean, not a
+tolerance, because the choice is between an error and a known-wrong answer — see
+`pbc::INTEGER_OCCUPATION_TOL` for why the cut is a constant. **Smearing is not what is refused**:
+the judgement is on the converged occupations, so a gapped system smeared below its gap passes.
+
+### Mode vectors
+
+`ForceConstants::frequencies(q)` throws the eigenvectors away; `modes(q)` returns them, from the
+same single diagonalization.
+
+```rust
+let m = fc.modes(q)?;
+m.frequencies_cm;   // Vec<f64>, ascending; negative = imaginary
+m.polarization;     // CMatrix, orthonormal e(q) -- columns are modes
+m.displacements;    // CMatrix, e_a / sqrt(m_a) -- what an atom does
+```
+
+**Both are returned because they answer different questions.** `polarization` is the eigenvector of
+the *mass-weighted* dynamical matrix, orthonormal, and is what belongs in a sum over modes.
+`displacements` divides by `√m_a` and is what to add to a geometry to follow a mode; it is not
+renormalized, deliberately, so the amplitude ratio between a heavy and a light atom is the physical
+one. Substituting one for the other is a `√(m_a/m_b)` error that produces a plausible-looking
+animation and wrong intensities. Columns are modes in both, ordered like `frequencies_cm`, and
+complex because away from Γ the pattern carries a Bloch phase between cells.
+
 Read [pbc.md](pbc.md) for the conventions and the limitations.
 
 ## 10. Divide-and-conquer
@@ -369,6 +425,29 @@ let gradient = divide_conquer_gradient(&mol, &params, &dc)?;
 
 `partition_atoms`, `build_subsystems` and `partition_weight_sum` are public so the partition and
 its sum rule can be inspected directly. See [divide-conquer.md](divide-conquer.md).
+
+**Geometry optimization, since 0.2.3.** `optimize_divide_conquer` runs L-BFGS on the DC gradient,
+so a structure too large for one full SCF can be relaxed rather than only measured.
+
+```rust
+use am1_rs::{optimize_divide_conquer, optimizer::OptOptions};
+
+let r = optimize_divide_conquer(&mol, &params, &opts, &dc_options, &OptOptions::default())?;
+r.molecule;           // the relaxed geometry
+r.converged;          // the optimizer's verdict
+r.iterations;
+r.trajectory;         // Vec<DcOptStep> -- the whole trace, not just the endpoint
+r.dc.total_ev;        // the DcResult at the final geometry
+```
+
+Two things about it are worth knowing before trusting the geometry. The line search accepts the
+**divide-and-conquer** energy rather than the full-SCF energy at the same point — `E_dc` is what
+the gradient differentiates, and testing Armijo against a different functional accepts steps that
+do not decrease the thing being minimized. And with Fermi filling the variational quantity is the
+free energy `E − TS`, which is what the search descends; whether the analytic force differentiates
+`E` or `E − TS` is not settled by any test in the suite, because the systems tested have gaps wide
+enough that the entropy is identically zero. The free energy is the safe choice, and the ambiguity
+is recorded in the source rather than resolved by assertion.
 
 ## 11. Errors
 

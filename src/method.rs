@@ -8,6 +8,22 @@
 //! parameter table is loaded. SAM1 is not like that: it replaces the parametric two-centre
 //! two-electron integrals with scaled *ab initio* ones over an STO-3G Gaussian basis, so it
 //! needs its own integral path as well as its own parameters.
+//!
+//! # References
+//!
+//! * **AM1** — M. J. S. Dewar, E. G. Zoebisch, E. F. Healy & J. J. P. Stewart, "AM1: A New
+//!   General Purpose Quantum Mechanical Molecular Model," *J. Am. Chem. Soc.* **107**,
+//!   3902–3909 (1985).
+//! * **RM1** — G. B. Rocha, R. O. Freire, A. M. Simas & J. J. P. Stewart, "RM1: A
+//!   Reparameterization of AM1 for H, C, N, O, P, S, F, Cl, Br and I," *J. Comput. Chem.*
+//!   **27**, 1101–1111 (2006).
+//!
+//! Only RM1's published main-group set (H, C, N, O, F, P, S, Cl, Br, I) is shipped. The paper's
+//! companion lanthanide parameters need d/f orbitals and the sparkle model, neither of which
+//! this crate implements. The parameter values are published scientific facts; the specific
+//! machine-readable tabulation came from MOPAC's Fortran source and its provenance, commit and
+//! licence are recorded in `third_party/mopac/README.md` and in the header of
+//! `src/data/rm1_parameters.csv`.
 
 use crate::error::{Am1Error, Result};
 

@@ -283,10 +283,37 @@ pub fn symmetric_eigen(a: &Matrix) -> Result<(Vec<f64>, Matrix)> {
     if n == 0 {
         return Ok((Vec::new(), Matrix::zeros(0, 0)));
     }
+    // **Say what is wrong with the input, not what the solver did about it.** faer reports
+    // `NoConvergence` for a matrix containing `NaN` or `∞`, which reads as an iteration-count
+    // problem and is not one — no tolerance or restart can decompose a matrix that is not a
+    // matrix of numbers. Checking costs `O(n²)` against an `O(n³)` decomposition, and it turns
+    // "faer eigendecomposition failed: NoConvergence" — which is what a fluorite HgF₂ calculation
+    // produced — into a message naming the first offending element.
+    for i in 0..n {
+        for j in 0..n {
+            let v = a[(i, j)];
+            if !v.is_finite() {
+                return Err(Am1Error::LinearAlgebra(format!(
+                    "the {n}x{n} matrix handed to the eigensolver is not finite: element \
+                     ({i}, {j}) is {v}. This is an upstream failure -- a diverged SCF, an \
+                     overflowing lattice sum, or a geometry with coincident atoms -- rather than \
+                     a problem with the decomposition"
+                )));
+            }
+        }
+    }
     let fa = faer::Mat::<f64>::from_fn(n, n, |i, j| a[(i, j)]);
-    let eigen = fa
-        .self_adjoint_eigen(faer::Side::Lower)
-        .map_err(|e| Am1Error::LinearAlgebra(format!("faer eigendecomposition failed: {e:?}")))?;
+    let eigen = fa.self_adjoint_eigen(faer::Side::Lower).map_err(|e| {
+        // A finite matrix that still will not decompose is a genuine conditioning failure, and
+        // the scale is the thing that makes it interpretable.
+        let scale = (0..n)
+            .flat_map(|i| (0..n).map(move |j| (i, j)))
+            .fold(0.0_f64, |m, (i, j)| m.max(a[(i, j)].abs()));
+        Am1Error::LinearAlgebra(format!(
+            "faer eigendecomposition of a finite {n}x{n} matrix failed: {e:?} \
+             (largest element {scale:.3e})"
+        ))
+    })?;
     let s = eigen.S();
     let u = eigen.U();
     // Sort eigenpairs into ascending order (the SCF aufbau occupies the lowest orbitals;

@@ -46,6 +46,13 @@ fixed point; the hybrid is the most robust and, in practice, also the fewest ite
 Second-order SOSCF (orbital-Hessian Newton) would give quadratic final convergence but is heavy
 for a minimal-basis semiempirical method — a documented optional follow-up.
 
+**Under a cell this is not enough**, and the periodic solver carries a second layer: a controller
+that reads the residual trace and answers charge sloshing with **Kerker preconditioning** and a
+stalled residual with a raised — then annealed — electronic temperature. The interesting part is
+the form Kerker takes without a plane-wave grid: `q²/(q² + q₀²)` rewritten against the Coulomb
+kernel is `(1 + κγ)⁻¹`, and NDDO's monopole `γ_ab` is exactly the atom-resolved Coulomb interaction
+that expression wants. See [pbc.md](pbc.md#the-scf-when-it-will-not-converge).
+
 ## Core–core repulsion (`repulsion.rs`)
 
 ```
@@ -142,6 +149,14 @@ Three implementation points worth stating, because each was a bug at some stage:
   `Am1Error::CphfNotConverged` is raised instead.
 * **Degenerate orbital pairs.** `|ε_a − ε_i|` in the denominator is guarded; near-degenerate
   frontier pairs are what make small-gap systems hard here.
+* **Integer occupations are assumed, and under a cell that assumption is now checked.** The sum
+  runs over occupied × virtual, which presupposes that every orbital is one or the other: there is
+  no `∂f/∂ε` term, so the response cannot move charge across a Fermi surface. For a molecule this
+  is unremarkable. Under a cell with smearing it is not, and through 0.2.2 the periodic paths ran
+  on a partially filled band anyway — the CPHF one dropping it from both sets, DFPT freezing the
+  occupation difference. `Am1Error::FractionalOccupation` is raised now, on the same principle as
+  the entry above it: a wrong Hessian that looks plausible is worse than no Hessian. See
+  [pbc.md](pbc.md#fractional-occupations-are-refused-not-approximated).
 
 The Hessian is checked against a finite difference **of the analytic gradient** rather than of
 the energy, which removes one order of finite-difference noise and makes a tight tolerance
@@ -255,15 +270,50 @@ those units, `1 e = 4.803 D/Å`, does involve one: it divides by the Bohr radius
 Bohr is MOPAC7's `0.529167 Å`. Mixing the two would be a fraction of a percent on every
 intensity — the kind of error that never announces itself.
 
-Rigid-body modes are identified by each mode's **overlap with the translation/rotation subspace**
-rather than by a frequency cutoff, so a linear molecule's five rigid-body modes are discovered
-rather than assumed from `3N − 6`.
+### Rigid-body modes are removed, not labelled
+
+Since 0.2.3 the translation/rotation subspace is **projected out of the mass-weighted Hessian
+before it is diagonalized**: an orthonormal basis `Q` of its complement is built, `QᵀH'Q` is
+diagonalized, and every eigenvalue that comes back is a vibration by construction. So
+`frequencies_cm` holds `3N − n_rigid` entries and there is nothing left to filter.
+
+`n_rigid` is the **rank** of the rigid-body span, so a linear molecule gives five and an atom
+three without anything having to decide that the molecule is linear. **Under a cell it is three**:
+a rotation is a symmetry of an isolated molecule and not of a crystal — rotating the contents of
+a cell without rotating the lattice costs energy — so those directions are ordinary vibrations of
+a supercell and projecting them out would delete real modes.
+
+What this replaced was a `|ν| < 50 cm⁻¹` cutoff applied downstream, and that rule was wrong in
+both directions: a soft torsion below 50 cm⁻¹ is a vibration, and away from a stationary point a
+rotation carries real curvature and lands well above 50. Measured on a deliberately stretched
+water, the unprojected route returned nine numbers with three rigid-body modes at **1238, 1234 and
+1238 cm⁻¹**, and the three genuine vibrations were contaminated by up to **311 cm⁻¹**.
+`rigid_body_frequencies_cm` reports the curvature left in each removed direction — zero only at a
+stationary point — which is the diagnostic the cutoff was standing in for, and
+`all_frequencies_cm` keeps the unprojected `3N` spectrum so the projection can be audited.
 
 ## Wavefunction output (`molden.rs`)
 
 The AM1 valence basis is genuinely Slater-type, so Molden's `[STO]` section represents it exactly
-and no Gaussian expansion has to be invented. Its line is `atom kx ky kz kr alfa norm` for the
-primitive `norm · x^kx y^ky z^kz r^kr e^{−alfa·r}`, which maps on without residue:
+and no Gaussian expansion has to be invented. That section is nevertheless **not the default**
+since 0.2.3, for a reason that has nothing to do with exactness: Jmol, VMD, Avogadro, Molden
+itself and Multiwfn all implement `[GTO]` and skip `[STO]`, and a file whose basis section is
+skipped renders orbitals from no basis at all. The default is a least-squares Gaussian expansion
+fitted at run time by `gto.rs` — exact closed-form Gram matrix, quadratured Slater overlaps, an
+even-tempered start refined by coordinate descent, cached per `(n, l, ngauss)` and transferred
+across `ζ` by the exact scaling `α → ζ²α`. Six primitives reproduce every shell in the parameter
+sets to an overlap better than 0.99999, which is written into the file's header. Nothing is taken
+from a published STO-*n*G table; those stop at `3d`, and this crate needs `4s`–`5p`.
+
+The `[MO]` coefficients are also transformed. NDDO solves `FC = Cε` with no overlap matrix, so `C`
+lives in an implicitly orthogonalized (Löwdin) basis while the file lists the raw, non-orthogonal
+functions — writing one against the other is not the same orbital. `S` is available (it is the
+analytic Slater overlap the resonance term already uses), so `S^{−1/2}C` is written by default;
+on water the largest off-diagonal `S` is **0.35**, so this is not a small correction.
+`MoldenOptions::deorthogonalize = false` restores the 0.2.2 coefficients.
+
+The `[STO]` line is `atom kx ky kz kr alfa norm` for the primitive
+`norm · x^kx y^ky z^kz r^kr e^{−alfa·r}`, which maps on without residue:
 
 ```text
 n s   →  kx=ky=kz=0, kr=n−1        (r^{n−1} e^{−ζr})
@@ -320,6 +370,26 @@ it — is **not periodic in `q`** and is undefined at a zone boundary where seve
 implemented and rejected on that measurement. The consequence is that `D(q)` is the full dynamical
 matrix and must not be composed with the LO–TO path; see [pbc.md](pbc.md), which carries the
 validation table.
+
+### The two mode vectors, and why both are returned
+
+`D(q)_{aα,bβ} = C(q)_{aα,bβ} / √(M_a M_b)` is what gets diagonalized, so its eigenvectors `e(q)`
+live in mass-weighted coordinates:
+
+```text
+D(q) e_n(q) = ω_n²(q) e_n(q),        e_m† e_n = δ_mn
+u_{n,a} = e_{n,a} / √M_a              (Cartesian displacement of atom a)
+```
+
+Both are returned (`polarization` and `displacements`) because the orthonormality that makes `e`
+the right basis for **sums over modes** is precisely what makes it the wrong thing to add to a
+geometry: it distributes amplitude by `√M`, so in `e` a hydrogen and a mercury move comparably and
+in reality they do not. Substituting one for the other is an error of `√(M_a/M_b)` per atom — 4
+between H and O, 14 between H and Hg — which produces a physically plausible animation and wrong
+intensities, so it is not the kind of mistake a picture catches.
+
+`u` is deliberately **not** renormalized after the division, since normalizing it would put the
+`√M` weighting straight back.
 
 See [pbc.md](pbc.md) for what all of this means in practice.
 

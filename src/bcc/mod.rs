@@ -8,9 +8,10 @@
 //! bond types → apply the additive **bond charge corrections** from antechamber's
 //! `BCCPARM.DAT` → AMBER-ready per-atom charges, optionally written as mol2.
 //!
-//! **Provenance.** The 405 bond-charge-correction parameters in `data/bccparm.dat` are the
-//! exact antechamber `BCCPARM.DAT` file from AmberTools (GPL-3); the atom-type scheme follows
-//! `ATOMTYPE_BCC.DEF` (retained under `third_party/antechamber/`). See `THIRD_PARTY_NOTICES.md`.
+//! **Provenance.** The 405 bond-charge-correction parameters are the exact antechamber
+//! `BCCPARM.DAT` file from AmberTools (GPL-3), and the atom-type scheme is its`n//! `ATOMTYPE_BCC.DEF`. Both are retained under `third_party/antechamber/` beside the licence
+//! that covers them and the README that records where they came from; both are `include_str!`-ed
+//! from there. See `THIRD_PARTY_NOTICES.md`.
 //!
 //! # Parameter coverage
 //!
@@ -62,7 +63,14 @@ use crate::topology::{BondOrder, Topology};
 use std::collections::HashMap;
 
 /// Embedded antechamber bond-charge-correction parameters (AmberTools `BCCPARM.DAT`, GPL-3).
-const BCCPARM: &str = include_str!("../data/bccparm.dat");
+///
+/// Included from `third_party/antechamber/` rather than from `src/data/`, so the file sits beside
+/// the licence that covers it and the README that says where it came from. It is retained
+/// **verbatim** — it is a bare numeric table with no comment syntax, so a provenance header could
+/// not be added to it without either changing the file or teaching the parser to skip something
+/// upstream does not have. Putting it next to its notices achieves the same end and leaves the
+/// bytes alone, which is what `ATOMTYPE_BCC.DEF` already does.
+const BCCPARM: &str = include_str!("../../third_party/antechamber/BCCPARM.DAT");
 
 #[derive(Clone, Debug)]
 pub struct BccResult {
@@ -278,6 +286,17 @@ fn bond_code_for_order(
 
 /// Write a minimal Tripos MOL2 file with the AM1-BCC charges.
 pub fn write_mol2(path: &str, molecule: &Molecule, bcc: &BccResult) -> Result<()> {
+    std::fs::write(path, to_mol2(molecule, bcc))?;
+    Ok(())
+}
+
+/// [`write_mol2`]'s text, without writing it anywhere.
+///
+/// Split out so the Python front end can emit a **byte-identical** mol2 without a second
+/// implementation of the format. It had one for about an hour; two hand-written writers of the
+/// same file format is the same trap the two CLI front ends are already in, and there is no
+/// reason to walk into it twice.
+pub fn to_mol2(molecule: &Molecule, bcc: &BccResult) -> String {
     use crate::constants::BOHR_TO_ANGSTROM;
     // The bonds the charges were computed against, not a second perception of the same geometry.
     let bonds = &bcc.bonds;
@@ -322,8 +341,7 @@ pub fn write_mol2(path: &str, molecule: &Molecule, bcc: &BccResult) -> Result<()
             code
         ));
     }
-    std::fs::write(path, s)?;
-    Ok(())
+    s
 }
 
 #[cfg(test)]

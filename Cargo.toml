@@ -1,6 +1,6 @@
 [package]
 name = "am1-rs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 # The MSRV is checked in CI. It is set by `let`-else and the 2021 edition, not by anything
 # exotic; raising it should be a deliberate decision, not a side effect of an edit.

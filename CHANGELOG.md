@@ -1,5 +1,682 @@
 # Changelog
 
+## 0.2.3
+
+### Added
+
+- **A periodic response on a partially occupied ground state is now an error, not a number.**
+  Every response path here — the `q = 0` Hessian, `Z*`, `ε_∞`, the polarizability, DFPT — is
+  derived at fixed integer occupation. There is no `∂f/∂ε` term anywhere in the coupled-perturbed
+  equations, so the Fermi surface cannot redistribute charge under the perturbation: a partially
+  filled band is a term the equations **do not have**, not a small error in the answer.
+
+  Through 0.2.2 both paths ran regardless, and each went wrong in its own quiet way. The CPHF path
+  classifies every band as occupied (`f > full − 1e-6`) or virtual (`f < 1e-6`) and a band between
+  the two is **neither** — dropped from the response entirely, taking its whole orbital-relaxation
+  contribution with it. DFPT keeps every band pair but weights each by a *frozen*
+  `f_n(k) − f_m(k+q)`. Both returned a plausible number, and nothing in the result said it was
+  outside what the equations cover. `Am1Error::FractionalOccupation` now names the k-point, the
+  band, the occupation and the smearing, in both paths.
+
+  **This does not gate smearing**, which is what the previous release made available precisely so
+  that a dense inorganic solid could reach a converged ground state at all. The judgement is on the
+  **converged occupations**, not on `smearing_ev > 0` — a gapped conduction band holds about
+  `exp(−gap/2kT)` electrons, which crosses the cut only when the gap falls under roughly `27·kT`.
+  Measured, in `tests/fractional_occupations.rs`: cubic BN at 4×4×4 and `kT = 0.3` — the case
+  `docs/pbc.md` tells a user to reach for — is **accepted**, as is AlP at 6×6×6 with none, which is
+  the mesh AlP's reported frequencies come from. AlP *under* smearing is refused, at a worst
+  fractional occupation of `1.8e-6` (4×4×4) and `2.0e-6` (6×6×6).
+
+  Refusing at `2e-6` reads like a threshold that wants loosening, and it is the opposite: at `2e-6`
+  the classifier already puts that band in neither set, so what is being refused is a response
+  missing an entire band. The cut is not an accuracy tolerance but the exact point at which the
+  surrounding code stops being able to represent the level, which is why `INTEGER_OCCUPATION_TOL`
+  is a constant rather than an option, and why the way out —
+  `PbcOptions::require_integer_occupations`, `allow_fractional_occupations=True` in Python and on
+  the ASE calculator — is a yes/no. The choice is between an error and a known-wrong number, not
+  between two accuracies.
+
+- **Phonon modes come back with their eigenvectors.** `ForceConstants::modes` in Rust,
+  `eigenvectors=True` on `native.phonons` and on the ASE calculator's `get_phonons`. Through 0.2.2
+  the diagonalization had the vectors in hand and threw them away, so learning *what* a mode does
+  meant running the whole calculation again in another program — and this release's own
+  investigation of Al₂(CH₃)₆ had to borrow the direction from the molecular Hessian for exactly
+  that reason.
+
+  **Two conventions come back, because they answer different questions and confusing them is a
+  mass-weighting error of `√(m_a/m_b)`** — a factor of 4 between hydrogen and oxygen, which looks
+  plausible in a picture. `polarization` is the orthonormal eigenvector `e(q)` of the mass-weighted
+  dynamical matrix, which is what belongs in any sum over modes; `displacements` is `e_a/√m_a`,
+  what an atom actually does and what to add to a geometry, deliberately **not** renormalized so
+  that a heavy and a light atom keep their true relative amplitude. Columns are modes, ordered like
+  `frequencies_cm`, and complex because away from Γ the pattern carries a Bloch phase between
+  cells.
+
+  Opt-in: `n_q · (3N)²` complex numbers is a large array to return unasked for a band structure
+  over a few hundred `q`. The native layer hands back the real and imaginary halves separately
+  since it has no complex type in a plain nested list; the ASE layer, which has numpy as a hard
+  dependency, joins them into one `complex128` array. `eigenvectors` is part of the ASE cache key —
+  without that the second of two calls at one geometry gets the first one's vectorless answer.
+
+- **The periodic SCF has a fallback pipeline, and says what it did.** One mixing scheme does not
+  converge every system, and the two ways it fails are distinguishable from the residual trace
+  alone: a residual that *grows or oscillates* is charge sloshing, and one that *decays at a ratio
+  above 0.99* is a near-degenerate Fermi level. So the controller watches for each and switches —
+  Kerker preconditioning with the mixing dropped to 0.1 and the DIIS history discarded for the
+  first, a raised electronic temperature for the second — starting from a superposition of atomic
+  densities and Pulay/DIIS at a mixing of 0.3.
+
+  **The raised temperature is annealed back down**, because smearing changes the *fixed point* and
+  not merely the path to it: a system's energy at 0.5 eV is not its energy at 0.05 eV. Convergence
+  is not accepted until the requested smearing is restored, so `converged` means converged at what
+  the caller asked for. `PbcResult::fallback` (`ScfFallback`) carries `kerker_kappa`,
+  `final_mixing`, `max_smearing_ev` and `diis_resets`, so a number knows its own provenance — a
+  system that needed 1 eV to move at all is telling you something about its Fermi surface, and that
+  should not be invisible in the result.
+
+  **Kerker had to be rederived to be usable here.** The plane-wave factor `A(q) = q²/(q² + q₀²)`
+  indexes the density by `q`, and this one is real-space blocks over an atom-centred basis;
+  transforming over the lattice-translation index instead is a projection onto far fewer k-points
+  than translations, which throws most of the residual away. Written against the Coulomb kernel it
+  is `A = (1 + κγ)⁻¹` with `κ = q₀²/4π`, and *that* form needs no plane waves: NDDO's monopole
+  kernel `γ_ab` is the atom-resolved Coulomb interaction and is already assembled. It is applied to
+  the **net charge per atom only** — intra-atomic rehybridization and bond-order changes are
+  short-ranged, are not what sloshes, and damping them would slow every system down to fix a few.
+  `DfptOptions::cpscf_kerker_kappa` exposes the same preconditioner to the response solve.
+
+- **Divide-and-conquer has a CLI switch and does geometry optimization.** `--dc` turns it on for
+  the `energy`, `gradient` and `optimize` modes, with `--dc-core` and `--dc-buffer` setting the
+  subsystem radii; the modes it does not cover refuse rather than silently running the full
+  calculation. `optimize_divide_conquer` (Rust) and `optimize=True` on `native.divide_conquer`
+  (Python) drive L-BFGS on the DC gradient, so a structure too large for a full SCF can be relaxed
+  rather than only measured. The result carries the per-step trace, the optimized geometry and the
+  usual `electronic_ev`/`core_ev`/`converged` keys.
+
+- **The coupled-perturbed solver's limits are settable from both APIs.** `cphf_max_iter` and
+  `cphf_tol` were private constants — 100 and `1e-9` for the molecular CPHF, 200 and `1e-8` for
+  the periodic one — so a system whose response needed more passes could not be given them from
+  Rust or from Python without editing the crate. They are fields on `Am1Options` and `PbcOptions`
+  now, which is what both surfaces already carry, and reach `hessian`, `frequencies`,
+  `ir_spectrum`, `vibrations` and the ASE calculator.
+
+  They are separate from `max_scf` on purpose: the response is a different fixed point from the
+  ground state, converging at its own rate and failing for its own reasons. `tests/cphf_controls.rs`
+  pins the defaults to the constants they replaced — turning a constant into an option is a chance
+  to change a number by accident, and that would show up as a slightly different Hessian rather
+  than as a failure — and checks that a cap of one iteration is honoured *and reported as one*,
+  which is what distinguishes a field that reaches the solver from one plumbed to nowhere.
+
+- **Geometry optimization under periodic boundary conditions** (`pbc::optimize_periodic`,
+  `native.pbc_optimize`, and the CLI's `optimize` mode whenever a cell is present). L-BFGS on the
+  k-point forces, and with `--relax-cell` on the analytic stress as well, at an optional target
+  pressure. The variables are scaled coordinates plus a strain measured from the starting cell, so
+  an atom on a symmetry site stays on it while the lattice deforms; a strain component is a
+  variable only when both its axes are periodic, so a slab's vacuum direction and a chain's two
+  transverse directions are frozen by construction rather than by an option.
+
+- **Periodic boundary conditions on the command line**, per axis. `--cell` takes 1, 3, 6 or 9
+  numbers (cube; `a b c`; `a b c α β γ`; or three lattice vectors), `--pbc x`/`xy`/`xyz`/`none`
+  sets the periodic axes, and `--pbc-x`/`--pbc-y`/`--pbc-z` set them one at a time and accumulate,
+  so a slab in the *xz* plane is `--pbc-x --pbc-z`. A cell also comes from an extended-XYZ
+  `Lattice="…"` comment line, which the Rust reader has always understood and the Python one now
+  does too. `--kpts` sets the SCF's Monkhorst–Pack mesh; `--no-pbc` drops the cell and runs the
+  contents of it as a molecule.
+
+  `energy`, `gradient`, `optimize` and `frequencies` take the periodic path when a cell is
+  present. `charges`, `ir` and `molden` are molecular-only and now **say so** instead of silently
+  ignoring the cell.
+
+- **A `phonons` mode**, with `--supercell`, and explicit control of where the bands are evaluated:
+  `--qpoints QX QY QZ …` for a list, or `--qpath` plus `--qpath-points` for a straight-line path
+  through named corners. Without either it reports the supercell's commensurate `q` — the only
+  ones it represents exactly — and says which case the output is.
+
+- **Orbital coefficients on the command line.** `orbitals --orbital-coefficients` prints the MO
+  coefficient matrix with per-AO labels (`O1:px`), for both spin channels, and every `orbitals`
+  run now ends with a frontier block giving HOMO, LUMO and the gap in Hartree *and* eV.
+
+- The Python front end gained `--mol2-output`, which only the Rust one had. The mol2 text is
+  rendered by the crate (`bcc::to_mol2`) so the two write the same bytes rather than the same
+  format.
+
+### Changed
+
+- **Molden output is `[GTO]` by default, and the coefficients now belong to the basis the file
+  declares.** Two independent problems, both of which made the rendered orbital not the orbital.
+
+  1. **`[STO]` is a section almost nothing reads.** The AM1 valence basis really is Slater-type,
+     so `[STO]` describes it exactly — and Jmol, VMD, Avogadro and Multiwfn all implement `[GTO]`
+     and skip `[STO]`, which leaves a viewer drawing orbitals from no basis at all. The default is
+     now a Gaussian expansion; `--molden-basis sto` keeps the old section for anything that reads
+     it.
+
+     The expansion is **fitted at run time, not tabulated** (`src/gto.rs`). The published STO-*n*G
+     tables stop at `3d` and at fixed exponents, and this crate needs `4s`–`5p` for Ge, As, Se,
+     Br, Sb, Te, I and Hg at whatever `ζ` a parameter file carries. So the contraction is solved
+     for: exact closed-form Gram matrix, quadratured Slater overlaps, an even-tempered start and
+     coordinate descent on the exponents, cached per `(n, l, ngauss)` and transferred across `ζ`
+     by the exact scaling `α → ζ²α`. Six primitives reproduce every shell in the parameter sets to
+     an overlap better than **0.99999** — measured, and written into the file's header so the
+     number travels with the data. Nothing is taken from a third-party table.
+
+  2. **NDDO's coefficients were being written against the wrong functions.** Its working equations
+     are `FC = Cε` with no overlap matrix, so `C` is expressed in an implicitly orthogonalized
+     (Löwdin) basis while the file listed the raw, non-orthogonal Slater functions. Through 0.2.2
+     the file carried a note apologizing for it. It no longer needs one: `S` is available — it is
+     the analytic Slater overlap the resonance integrals already use — so `S^{−1/2}C` is written
+     instead. On water the largest off-diagonal `S` is **0.35**, so this is not a small
+     correction. `--molden-orthogonal` restores the 0.2.2 coefficients.
+
+  The occupation/orbital correspondence is now checked by **rebuilding the density from the file's
+  own text** — parsing the `Occup=` fields and contracting `Σ_k occ_k C_k C_kᵀ` — and comparing it
+  against `scf.density`, for RHF and UHF. The old test compared the writer's output against the
+  expression the writer used, which cannot detect a transposition or an off-by-one and says so in
+  its own comment.
+
+- **Vibrational frequencies have translations and rotations projected out, and the `|ν| < 50 cm⁻¹`
+  rule is gone.** `vibrational_analysis` now diagonalizes `QᵀH'Q` on an orthonormal basis of the
+  complement of the rigid-body subspace, so `frequencies_cm` holds `3N − n_rigid` entries and
+  every one of them is a vibration by construction. `n_rigid` is the *rank* of the
+  translation/rotation span — 6, or 5 for a linear molecule, or 3 for an atom — and is discovered
+  rather than assumed.
+
+  The threshold it replaces was wrong in both directions. A torsion below 50 cm⁻¹ was labelled a
+  rotation; and away from a stationary point a rotation carries real curvature and lands well
+  above 50. Measured on a deliberately stretched water: the old route returned nine numbers, three
+  of them rigid-body modes sitting at **1238, 1234 and 1238 cm⁻¹**, and the three genuine
+  vibrations were contaminated by up to **311 cm⁻¹**. The new `rigid_body_frequencies_cm` reports
+  that residual instead of hiding it, and it is zero only at a stationary point — which is the
+  diagnostic the tag was standing in for.
+
+  `IrSpectrum` follows: `3N − n_rigid` intensities, and no rigid-body bands to filter out.
+
+### Fixed
+
+- **A field along `pbc_optimize`.** `electric_field` reached `pbc_point` and the Hessian but was
+  silently dropped by the periodic optimizer and by the Python CLI's periodic path, so a relaxation
+  under a field quietly relaxed without one.
+
+- **`native.dfpt(smearing_ev=…)` reached the binding.** The Rust entry point gained the parameter
+  earlier in this release, the wrapper's signature and docstring advertised it, and the forwarding
+  call never passed it — so from Python it did nothing, and a caller who set it got a calculation
+  at zero smearing that they believed was smeared.
+
+  Nothing in the suite could catch that. `tests/test_result_contract.py` checks the keys a result
+  carries, and every key was there; `tests/test_cli_matrix.py` diffs the two front ends, and the
+  CLI does not expose this parameter. A **dropped argument** is invisible to both — the call
+  succeeds and returns a plausible number. `tests/test_binding_arity.py` closes the class rather
+  than the instance: it parses every `#[pyo3(signature = …)]` and counts what the matching wrapper
+  forwards, so the next parameter added to a signature and forgotten in the call fails at the
+  boundary. Writing it found its own false positive first — `divide_conquer`'s signature carries a
+  `//` comment whose prose contains commas, which the parser counted as a parameter.
+
+- **A mercury phonon calculation failed with "eigendecomposition failed: NoConvergence".** The
+  message named the decomposition; the cause was fourteen array slots away.
+
+  MOPAC's per-element tables are indexed by *parameter slot*, not by atomic number: the
+  lanthanides have no NDDO parameters, so La-Yb (57-70) are simply absent and every element above
+  caesium sits fourteen places too low. Transcribed into a Z-indexed array without reopening that
+  gap, mercury's 200.59 amu landed at index 66 and `MASS[80]` was left at `0.0`.
+
+  A zero mass is not a wrong frequency. Every vibrational quantity divides by `sqrt(M_a M_b)`, so
+  `D(q) = a0^2 C(q)/sqrt(M_a M_b)` returned `-inf` for the mercury rows, and the first thing to
+  notice was the eigensolver. Instrumenting the whole DFPT assembly found the Ewald sums, the
+  bare perturbation, the band energies, the response denominators and `C(q)` itself all finite --
+  which is what pointed at the one step after them. Hg is the only element above Z = 56 that AM1
+  parameterizes, which is why nothing else could reach it.
+
+  `EHEAT_KCAL` carried the identical shift, papered over: someone had written mercury's 14.690
+  into index 80 by hand and left the shifted copy at index 66, so the symptom was invisible for
+  the only element that reaches it while every entry between was still a neighbour's value. Both
+  tables now reopen the gap. `data_tables::atomic_mass` refuses a zero rather than dividing by
+  it, and the three mass-weighting sites call it, so a future element added without a mass is
+  named where it is missing instead of at the eigensolver.
+
+  `tests/atomic_data.rs` pins the indexing at the elements either side of the gap and, separately,
+  asserts that atomic mass rises with atomic number everywhere except the three places it famously
+  does not (Ar/K, Co/Ni, Te/I) -- a structural check that catches a shift introduced anywhere,
+  not only where someone thought to write an anchor. Fluorite HgF2 now returns three acoustic
+  modes at 1e-6 cm^-1 and a triply degenerate optic mode at 176 cm^-1.
+- **A periodic single point through the Python CLI died with `am1-rs: 'electronic_ev'`.** One
+  word, no verb: that is what a `KeyError` looks like after the CLI's blanket `except Exception`
+  has caught it. `native.pbc_point` never emitted `electronic_ev` or `core_ev`, which the
+  molecular `single_point` has reported since 0.1, so the periodic energy report reached for a key
+  that was not there — *after* running the whole SCF.
+
+  This is the second time a CLI mode has been broken by a key the bindings do not emit (0.2.2
+  fixed three of five modes), and reading the two front ends side by side is evidently not a way
+  to catch it. Two tests now do:
+
+  - `tests/test_result_contract.py` writes the contract down. For every native entry point it
+    lists the keys a *consumer* — the CLI, the ASE calculator, the documented API — depends on,
+    and asserts they are present, together with the shape agreements between them (the mode count
+    of `frequencies_cm` against `modes`, the polar tensor's `3N` columns against the modes'
+    `3N − 6`). Adding a key is free; removing one fails at the boundary.
+  - `tests/test_cli_matrix.py` runs **every mode against every combination of the options that
+    apply to it** — several hundred command lines — asserting that none produces a traceback or a
+    bare quoted identifier, and then diffs a representative subset against the Rust binary byte
+    for byte. It found this bug, and three more listed below, on its first run.
+
+  The CLI's reads now also go through a checked accessor, so an unforeseen missing key becomes a
+  message naming the key, the mode and the module path rather than a one-word mystery.
+
+- **The reported periodic Fermi energy was zero for every bound system.** `PbcResult::fermi_energy_ev`
+  was folded with `max` from an accumulator initialised to `0.0`, and a chemical potential is a few
+  eV *below* vacuum, so `max(0, −4.6)` is `0`. It reached users through `native.pbc_point` and
+  through `Calculator.results["fermi_energy"]`. The accumulator starts at `−∞` now. The one test
+  that looked at the value printed it rather than asserting on it; it asserts.
+
+- **Two more front-end divergences the matrix test found.** `native.pbc_optimize` inherited
+  `fold_time_reversal = false` from the shared periodic setup — which the *response* entry points
+  need and a ground-state relaxation does not — so it sampled 4 k-points where `run_pbc_scf`
+  samples 3. And the periodic `optimize` mode printed the optimizer's step count where the SCF's
+  belonged, reporting "3 iterations" for a 16-iteration SCF.
+
+#### Phonons
+
+- **Force constants were filed under the wrong lattice translation, so every interpolated band was
+  wrong.** A supercell's Γ Hessian is an aliased sum `H_{(0,a),(t,b)} = Σ_N Φ_ab(T_t + N)`, and
+  `Φ_ab(T_t)` was read off it with `T_t` taken from the order the atoms were *built* in — `0, 1, …
+  n−1` along each axis. On a three-fold cell that files the neighbour on one side under `+2` when
+  it physically sits at `−1`.
+
+  At a **commensurate** `q = m/n` the two labels give the same Bloch phase, which is why every
+  phonon test in the suite passed: `tests/pbc_phonon.rs` only ever asked for the points the
+  supercell represents exactly. Between them they are simply different numbers — on an H₂ chain at
+  the zone boundary the two spectra differ by **22 cm⁻¹**, and `Φ(T) = Φ(−T)ᵀ`, an exact symmetry
+  of the real force constants, was violated by **7.1e-3** where it is now **6.1e-11**.
+
+  Each block is now assigned to the **minimum image** of `r_b + T − r_a` over the translations
+  congruent to `T_t`, split equally when several tie. `tests/phonon_interpolation.rs` reconstructs
+  the old labelling from the new one and shows the two agree at every commensurate `q` to `4e-12`
+  and disagree elsewhere. It also records what does *not* distinguish them: `ω(q) = ω(−q)` holds
+  for both, because `Φ` is real and `dynamical_matrix` symmetrizes.
+
+- **Three modes at `q = 0` were not zero, while the acoustic sum rule read `1e-15`.** Diamond in
+  its fcc primitive cell came out with acoustic frequencies of **−275, −275 and −65 cm⁻¹**.
+
+  The sum rule `Σ_{T,b} Φ_ab(T) = 0` is a statement about the **rows** of `Φ`, and
+  `dynamical_matrix` symmetrizes `D(q)` before diagonalizing it — so the spectrum sees the average
+  of the row and column sums, and the column sums vanish only if `Φ_ab(T) = Φ_ba(−T)ᵀ`. The
+  supercell Hessian satisfies that only as well as its real-space and exchange cutoffs do:
+  measured on graphene, row sums `1.8e-9` and column sums `8.2e-4`. The rule genuinely held, and
+  it was the wrong rule to hold alone.
+
+  `enforce_acoustic_sum_rule` now imposes both, by alternating projection, and
+  `transpose_asymmetry()` reports the second one. The alternation has a fixed point at the
+  *antisymmetric* part of the sum-rule violation — a rotational residue the translational rule
+  does not constrain — which on graphene is `6.5e-6` eV/Bohr² against a `|Φ|` of 18.7 and reaches
+  the acoustic branch as **0.7 cm⁻¹**. That is documented rather than iterated against.
+
+#### Two more defects the crystal survey turned up
+
+- **The rigid-body projector removed rotations from a periodic structure.** A rotation is a
+  symmetry of an isolated molecule and not of a crystal — rotating the contents of a cell without
+  rotating the lattice costs energy — so its directions are ordinary vibrations of a supercell, and
+  projecting them out deleted two or three genuine modes. `translation_rotation_basis` now returns
+  translations only under a cell. `tests/pbc_phonon.rs` is what caught it: the supercell-folding
+  identity is a statement about the **full** spectrum, and the mode counts stopped matching.
+
+  `VibrationalModes::all_frequencies_cm` is added alongside it — the unprojected `3N` spectrum,
+  which is what 0.2.2 returned — so the projection is auditable rather than taken on trust, and so
+  that identity can be stated against the quantity it is actually about.
+
+- **DFPT did not impose the acoustic sum rule.** The supercell route corrects `Φ(T)`; DFPT
+  computes the response directly at each `q` and so has no `Φ(T)` to correct — but the ground
+  state underneath it still carries the real-space and exchange cutoffs, and what those leave
+  behind lands on the acoustic branch. `C(0)` now has its row sums subtracted from the on-site
+  block, exactly as the supercell path does, and only at `q = 0` — the only `q` where a uniform
+  translation is a solution and the rule says anything. The row sums go to **exactly zero**.
+
+  `tests/phonon_acoustic.rs` checks that on the **matrix**, not on a spectrum, and deliberately:
+  "the three lowest frequencies are zero" is a *different* claim, true only at a stationary point.
+  An H₂ chain has two genuinely imaginary transverse modes that sort below its three acoustic
+  ones, and wurtzite ZnO likewise comes out `−80, −80, 0, 0, 0` — three zeros and an instability,
+  not five near-zeros. Reading the sorted list's first three entries as "the acoustic modes" is
+  how that gets mistaken for a sum-rule failure, which is exactly what happened while this was
+  being written.
+
+- **The eigensolver reported `NoConvergence` for a matrix that was not finite.** faer says that
+  for a matrix containing `NaN` or `∞`, which reads as an iteration-count problem and is not one —
+  no tolerance or restart can decompose something that is not a matrix of numbers.
+  `symmetric_eigen` now checks its input first, at `O(n²)` against an `O(n³)` decomposition, and
+  names the first offending element and the likely upstream cause; a *finite* matrix that still
+  fails reports the largest element alongside, because the scale is what makes a conditioning
+  failure readable.
+
+  It immediately paid for itself. A fluorite HgF₂ DFPT calculation used to fail with
+  `faer eigendecomposition failed: NoConvergence`, which points at the decomposition. It now says
+  `the 18x18 matrix handed to the eigensolver is not finite: element (0, 0) is -inf`, which points
+  where the problem actually is — HgF₂'s *ground state* converges in 17 iterations, so the `−∞` is
+  produced inside the response assembly. That is a real remaining defect, now localized rather
+  than mistaken for a linear-algebra one.
+
+- **DFPT and every other periodic response entry point could not use Fermi smearing.**
+  `periodic_setup` hardcoded `smearing_ev = 0.0`, so the ground state a response is built on had to
+  converge under sharp aufbau filling — which, on a coarse mesh, an inorganic solid does not.
+  `dfpt` takes `smearing_ev` now. It converges the ground state; the coupled-perturbed equations
+  above it still assume integer occupations, and the docstring says so rather than implying a
+  metal is in scope.
+
+### SCF robustness
+
+A phonon calculation on any dense inorganic crystal failed with `AM1 SCF did not converge after
+900 iterations (error=NaN)`. That message was wrong in a way worth stating first.
+
+- **`error=NaN` was a hardcoded `f64::NAN` placeholder**, not a measurement. `run_am1` filled the
+  error variant's `error` field with it on every non-convergence, so the one number a user had to
+  go on was a constant — and it reads as an arithmetic overflow, which is a different problem with
+  a different remedy. It now carries the commutator norm the last iteration actually reached.
+  Measured on zincblende AlP: `1.344e0`, not `NaN`.
+
+- **`AM1_SCF_DEBUG=1`** now traces the iteration — energy, `dE`, `dP`, `‖[F,P]‖`, the HOMO–LUMO
+  gap and the DIIS step weight. The gap and the weight are there because they separate the two
+  ways an SCF fails, and from the outside both look like a residual that stops falling.
+
+With that in place, three plausible causes were **ruled out by measurement** rather than by
+argument:
+
+| suspected cause | what the trace shows |
+|---|---|
+| band crossing at the Fermi level | the gap is **183 eV** and never closes; the occupied set cannot change identity |
+| DIIS charge sloshing / runaway extrapolation | the step weight is pinned at **1.00** — A-DIIS coefficients live on the simplex |
+| the wrong accelerator | plain iteration, CDIIS and the A-DIIS→CDIIS hybrid **all fail identically** (`tests/scf_hardening.rs`) |
+| no damping in the molecular solver | added it; with damping down to 0.05 the residual still plateaus at 1.3 |
+
+What is left is that the aufbau fixed point is not reachable for these systems at all, which
+together with `max_image_overlap = 0.20` — NDDO's working equations assume zero overlap between an
+atom and its own periodic images — reads as the model being outside its domain rather than the
+solver being at fault. `docs/pbc.md` says so, and DFPT is the route that does work for them.
+
+Two candidate fixes were then implemented, measured, and **removed again** — measuring them is
+what the exercise was for. Both are recorded in the source where a future reader will look
+(`scf::diis_extrapolate_packed`, and the note above `scf::scf_debug`):
+
+- **A `Sum|c_i|` bound on the molecular DIIS.** The periodic solver caps it at 40 and this one did
+  not, which looked like an oversight. Refusing an over-weight step made the A-DIIS->CDIIS hybrid
+  fall back to plain iteration at handover: 23 iterations on formaldehyde against **11** unbounded.
+  Shrinking the history window instead recovered formaldehyde but broke a diamond supercell, whose
+  error vectors are near-dependent in *every* window near convergence. And it fixed nothing --
+  AlP fails identically under all three accelerators. Only the non-finite check survives.
+
+- **A stagnation escape**: twelve iterations without beating the best residual halves the density
+  mixing and clears the history. It did not converge AlP (still `1.3` at a mixing of 0.05), and it
+  broke cases that worked. "Not beating the best" is also true of a run improving steadily but
+  *slowly*, and a graphene supercell improves 0.4 % per iteration -- the rule fired five times and
+  turned a comfortable 800-iteration budget into an insufficient one. It also fired in a lone
+  carbon atom's convergent tail at `|[F,P]| = 9.3e-6` and moved a converged energy by `1e-4` eV.
+
+What is kept is what was measured to help:
+
+- **A non-finite iterate is now `ScfDiverged`, reported at the iteration it happens.** Once `NaN`
+  reaches the density every comparison against a tolerance is false, so the old loop could neither
+  converge nor notice, and ran out its whole budget first.
+
+- **The Rust CLI printed "SCF converged in N iterations" for a periodic SCF that had not
+  converged.** `run_pbc_scf` reports `converged: false` rather than erroring, and the front end
+  did not look. `native.pbc_point` has always raised, so the two front ends disagreed about
+  whether the same input was a result or a failure; the Rust side now agrees with the Python one,
+  in the same words.
+
+- **The UHF CPHF got the conjugate-gradient solver the restricted path has had since 0.2.1.** Its
+  DIIS-accelerated fixed point does not always converge: on the RM1 methyl radical the residual
+  falls to `2e-8` and then **oscillates** between `2e-8` and `6e-7` for the rest of the iteration
+  limit, so `am1-rs frequencies --method rm1 --uhf` and `ir` failed outright. CG on the coupled
+  `(alpha, beta)` orbital Hessian has no such failure mode and takes about half the Fock builds.
+  Where the curvature is not positive -- an unstable UHF solution, which that radical genuinely
+  has -- it falls back to the fixed point, and the error now **says which** case it is instead of
+  advising more iterations for a saddle point no iteration count can fix.
+
+### Performance
+
+- **The periodic paths had no timing instrumentation at all**, which is why the two findings below
+  went unnoticed. The molecular side has had `AM1_TIMING` since 0.1; `pbc::scf` and `pbc::dfpt` had
+  none, so every claim about where periodic time went was a guess. They are instrumented now
+  (`pbc:core`, `pbc:ewald`, `pbc:fock`, `pbc:bloch`, `pbc:eigen`, `pbc:fill`, `dfpt:scf`,
+  `dfpt:skeleton`, `dfpt:bands`, `dfpt:cpscf`, `dfpt:contract`), and both findings were the first
+  thing the profile said.
+
+- **The Bloch sum was 41 % of a periodic SCF** — more than the eigendecompositions it feeds.
+  `H(k) = Σ_T e^{iq·T} H(T)` was a scalar loop through 2D indexing, run once per k point, so the
+  same `n_T · nao²` array was streamed `n_k` times per iteration. Written across the mesh it is two
+  matrix products: pack the blocks as one `n_T × nao²` panel and the phases as `n_k × n_T` cosine
+  and sine matrices. Measured interleaved in one process, best of seven: 699 translations × 24 AOs
+  at 19 k-points, **11.8 ms → 4.4 ms (2.7x)**, agreeing with the loop to 1e-12.
+
+- **The inverse Bloch sum inside the CPSCF was 92 % of a DFPT phonon run.**
+  `Δp(T) = Σ_k w_k e^{−ik·T} ΔP(k)` ran once per spin channel per CPSCF iteration per
+  perturbation — the innermost thing in the calculation — as `n_k · n_T · nao²` calls to
+  `ComplexBlocks::add`, **each of which hashed the translation to find its block**. On zincblende
+  AlP at a 3×3×3 mesh that is 1.6 million hashed lookups per iteration per perturbation. It is the
+  same two matrix products as the forward direction. Measured A/B in one process:
+  **5.47 s → 2.28 s for the whole run (2.4x)**, `dfpt:cpscf` from 147 to 33 thread-seconds, with
+  the frequencies bit-identical.
+
+- **The periodic Fock build now contracts in the packed pair basis**, as the molecular one has
+  since 0.1. `(μν|λσ)` depends on its index pairs only through their packed forms, so a `4×4×4×4`
+  nest visits each stored integral 2.56 times over and recomputes `pack` for every visit. Folding
+  each on-site density onto the same packed index turns both Coulomb directions into one pass over
+  `w`: `10×10` multiply-adds on contiguous rows instead of `2 × 256` through a strided symmetric
+  matrix. The exchange hoists its bra row out of the inner loop, sixteen lookups instead of two
+  hundred and fifty-six. This is an **operation count, not a measurement** — per-phase wall clock
+  on the development machine moves by 2.5x on unchanged arithmetic, which is larger than the
+  effect.
+
+- **`C(q)`'s contraction now picks the cheaper of two routes** instead of assuming. Holding the
+  bare perturbation sparsely costs `ndof² · n_k · nnz`; Bloch-summing it once and contracting
+  densely costs `ndof · n_k · nnz + ndof² · n_k · nao²`. The module assumed sparse always wins, and
+  on the H₂ chain it was validated against it does — but `nnz` counts entries over every
+  translation inside the 40 Bohr cutoff, and a *small* cell admits hundreds. Rutile GeO₂ measures
+  `nnz = 110944` against `nao² = 576`, where sparse does 190 times the work. `select_contraction`
+  compares the two counts, and the memory the dense route would need, per calculation.
+  `tests/pbc_dfpt_contraction.rs` exercises both sides of the crossover and checks they agree
+  (1.8e-15). On AlP the two are within measurement noise of each other, because after the fix
+  above the contraction is 0.5 % of the run; the choice matters at larger `ndof`, where the sparse
+  cost grows quadratically in it and the dense cost linearly.
+
+- **The CPSCF's Pulay Gram matrix is carried between iterations.** `pulay_coefficients` rebuilds
+  `⟨r_i, r_j⟩` for every pair on every call — `n(n+1)/2` dot products over vectors as long as the
+  real-space response. In the ground-state SCF that is once per iteration and lost in the noise; in
+  the CPSCF it is once per iteration **per perturbation**, and it measured as the largest single
+  piece of the solve: `cpscf:mix` was **17.4 %** of a DFPT phonon run on zincblende AlP, more than
+  the two-electron kernel build beside it. Between iterations the history gains one residual and
+  loses at most one, so exactly one row is new. Keeping it costs `depth²` floats and turns 55 dot
+  products into 10: `cpscf:mix` fell to **10.3 %**, and the coefficients are bit-identical to the
+  rebuilt ones (`tests/pbc_dfpt_contraction.rs`).
+- **Known limit.** Rutile GeO₂'s CPSCF does not converge: it stops at the 200-iteration cap with a
+  residual of 8.2e-8 against a 1e-10 tolerance. The response solve, not the ground state, is the
+  stiff part of a phonon calculation on a dense oxide. Recorded rather than worked around.
+
+### Validation
+
+- **The crystal phonon battery, re-run through DFPT.** Every structure type: rocksalt, zincblende,
+  wurtzite, rutile, fluorite, perovskite, spinel and a layered rocksalt. AM1 has no sodium, so the
+  rocksalt entry is ZnO in NaCl's structure rather than NaCl itself.
+
+  Against measured Raman/infrared frequencies, where the structure converges:
+
+  | structure | mode | measured | am1-rs | |
+  |---|---|---|---|---|
+  | rutile GeO₂ | Eg | 680 | 680 | +0.0 % |
+  | rutile GeO₂ | A1g | 702 | 717 | +2.1 % |
+  | rutile GeO₂ | B2g | 870 | 890 | +2.3 % |
+  | zincblende ZnS | TO / LO | 274 / 352 | 294 / 345 | +7.2 / −2.1 % |
+  | zincblende AlP | TO / LO | 440 / 501 | 459 / 563 | +4.3 / +12 % |
+  | zincblende BN | see note | 1055 / 1305 | 1084 / 1139 | |
+  | perovskite NH₄ZnF₃ | NH₄⁺ stretch | 3145 | 3133 | −0.4 % |
+  | perovskite NH₄ZnF₃ | NH₄⁺ bend | 1450 | 1569 | +8.2 % |
+  | fluorite HgF₂ | T2g | 236 | 176 | −25 % |
+  | wurtzite ZnO | E2(high) | 437 | 535 | +22 % |
+
+  The acoustic sum rule holds throughout: three modes at `10⁻⁵ cm⁻¹` or better on every structure
+  that converges. Fluorite HgF₂ returns its T2g as an exactly threefold degenerate `176/176/176`,
+  which is the cubic symmetry the code has to reproduce and not an average of three numbers that
+  happen to be close.
+
+  **BN is the one whose splitting pattern is wrong, and it is left open.** ZnS gives `294/294/345`
+  and AlP `459/459/563` — a doubly degenerate TO with the LO above it, which is the right shape.
+  BN gives `1084/1139/1139`: the *singlet* is below the doublet, so the LO would be under the TO.
+  The magnitudes are reasonable and the acoustic modes are clean, so this is not the AlP failure
+  again; it is either a mesh that is still too coarse at 6×6×6 or something in the polar term for
+  this cell. Recorded rather than presented as agreement.
+
+- **AlP's spurious 2657 cm⁻¹ Γ mode was a k-mesh artifact, not a bug.** It had been on the open
+  list since the first battery. Zincblende's Γ optic modes are `T₂` — the LO–TO splitting is the
+  non-analytic term and needs a direction — so `463 / 561 / 2657` is not a physical spectrum, and
+  2657 cm⁻¹ is not a possible Al–P frequency at all. Sweeping the mesh settles it:
+
+  ```text
+  2×2×2   511  535  535        ground state E = −259.96 eV
+  3×3×3   the periodic SCF does not converge
+  4×4×4   463  562  2657       ground state E = −179.85 eV
+  6×6×6   459  459  563        ground state E = −179.92 eV
+  ```
+
+  At 6×6×6 the doublet is the TO and the singlet the LO above it, which is the right pattern. The
+  2×2×2 ground state is 80 eV below the other two on a **two-atom cell** — that is a different
+  electronic state, not k-convergence. All four meshes report `max_image_overlap = 0.20` against
+  NDDO's assumption of zero, which is the standing diagnostic for exactly this: a cell where the
+  model is out of domain has more than one SCF solution, and a coarse mesh finds the wrong one.
+
+- **Spinel ZnAl₂O₄ is what found the response-tolerance bug, and it is the best agreement in the
+  battery.** It first failed at the SCF — through the *supercell* route, which runs the molecular
+  SCF at Γ with no k-mesh. On the k-point route its ground state converges without difficulty, 79
+  iterations at a 2×2×2 mesh. The response then reached `1.025e-9` and was **refused** against
+  `cpscf_tol = 1e-10`. That default is three orders tighter than the `p_tol = 1e-7` of the density
+  being differentiated, and it was throwing away a converged answer. With the corrected default:
+
+  | Raman (gahnite) | measured | am1-rs | |
+  |---|---|---|---|
+  | | 417 | 418 | **+0.1 %** |
+  | | 512 | 486 | −5.0 % |
+  | | 660 | 650 | −1.5 % |
+  | | 720 | 704 | −2.2 % |
+
+- **Organometallics.** Dimethylzinc Zn(CH₃)₂ gives three acoustic modes at `2.8e-5 cm⁻¹`, no
+  imaginary branch, and ν_s/ν_as(ZnC) within 6 % with δ_as(CH₃) at −0.2 %. Trimethylaluminium
+  Al₂(CH₃)₆ resolves the bridging and terminal Al–C stretches *separately* — 577 against a measured
+  ~560, and 667 against ~700 — which is the structure-sensitive part.
+
+  It also keeps two imaginary modes, −1277 and −321 cm⁻¹, at a geometry relaxed to
+  `max|F| = 4e-4 eV/Bohr`. **That is a genuine index-2 saddle, and it was checked rather than
+  asserted.** Following the mode downhill — displace 0.3 Å along its eigenvector and re-relax —
+  drops the energy by **6.96 eV**, moves atoms by up to 2.2 Å, and lands on a structure with **no
+  imaginary modes at all**. The mode is carried by the hydrogens of a bridging methyl.
+
+  What it descends *to* is the interesting part: the minimum has **no bridging carbons left** — six
+  terminal Al–C at 1.78 Å and Al–Al at 3.67 Å, against a measured dimer's 2.14 Å bridges and 2.60 Å
+  Al–Al. **AM1 does not bind the methyl-bridged dimer**; it dissociates Al₂(CH₃)₆ into two AlMe₃.
+  That is a statement about the model rather than about this crate, and an unsurprising one — the
+  bridge is a three-centre two-electron bond and NDDO has no description of one — but it means the
+  "ν(AlC) bridge" row above is comparing against a frequency the model does not have. At the true
+  AM1 minimum the terminal stretch is −1.7 % and ν(CH) +1.8 %, which is what a monomer should give.
+  
+  Two things had to be verified before that conclusion could be drawn, because a first attempt got
+  it backwards by comparing two different geometries:
+  
+  * the **periodic Hessian is correct** — at the same geometry in a 24×22×22 Å cell it reproduces
+    the molecular Hessian to 0.3 % (−1404 against −1400, −633 against −631, −281 against −281), so
+    the −1277 in the 11×9×9 cell is real intermolecular stabilization of a real saddle and not an
+    artifact of the periodic path;
+  * `native.phonons` returned frequencies **without eigenvectors**, so a mode could not be followed
+    from a phonon result at all; the direction had to come from the molecular `frequencies`, whose
+    `cartesian_displacements` was a valid source only because the two Hessians agree in a large
+    cell. That gap is closed in this release — see `eigenvectors=True` under **Added** — so the
+    same investigation is now one calculation rather than two.
+
+  Zn(CH₃)₂'s **phonon bands** along Γ–Z–Γ–X are the clearest check of the interpolation: the
+  branches disperse along the stacking axis, where the molecules touch, and are flat to the eye
+  across the 8 Å of vacuum, with every intramolecular branch flat in both. A 1×1×3 supercell
+  resolves `Φ(T)` along `c` only, and that shows: the row sum rule reaches `9.1e-16` while the
+  transpose asymmetry only reaches `3.8e-3`, leaving a −27 cm⁻¹ dip near Γ.
+
+- **Still failing, and recorded as such.** The layered rocksalt does not reach a converged SCF, and
+  nor does AlP through the supercell route at any size tried. The structures themselves are
+  verified — the spinel builder checks Zn tetrahedral and Al octahedral coordination before
+  running, and the layered cell checks both cations are octahedral — so this is the SCF, not a
+  mis-built cell.
+
+### Attribution and documentation
+
+- **The MOPAC attribution was checked against the upstream tree, and one claim in this release was
+  withdrawn.** `src/data_tables.rs` was added to MOPAC's provenance table earlier in 0.2.3 on the
+  strength of the mercury bug: `EHEAT_KCAL` and `MASS` both skipped exactly the fourteen
+  lanthanides MOPAC omits for want of NDDO parameters, which looked like the signature of a copied
+  slot-indexed array. Checking a working tree at the pinned commit shows otherwise.
+
+  MOPAC's `parameters_C.F90` is indexed by **atomic number**: `eheat(80)` is mercury's 14.690 and
+  the lanthanides carry real values. Nothing upstream has the gap. Comparing values as well:
+  `MASS` is not MOPAC's table at all — twelve of fifteen sampled elements differ (Tc **97.0**
+  against 98.9062, Ti 47.867 against 47.90, W 183.84 against 183.85), which is modern IUPAC
+  against MOPAC's older set. `EHEAT_KCAL` differs at eighteen entries below `Z = 86`, sodium and
+  vanadium among them. `MASS` has been removed from the provenance table, `N_S`/`N_P`/`QN` were
+  listed there in error and are not, and the origin of the fourteen-slot gap is now recorded as
+  **unknown** rather than attributed to a source that has been checked and does not have it.
+
+  **§4(d) is now verified rather than open.** `git ls-tree -r HEAD` at
+  `052691223d19935a89f0fe18cd12301bd83e4201` lists no `NOTICE` file anywhere, so the clause does
+  not apply; the upstream copyright travels in per-file headers, and our `LICENSE` is
+  byte-identical to upstream's. The clause-by-clause position on §4(a)–(d) is written out in
+  `third_party/mopac/README.md`.
+
+- **`BCCPARM.DAT` moved to `third_party/antechamber/`.** It was the one embedded data file with no
+  provenance anywhere near it: the two parameter CSVs carry a header naming their source, and a
+  bare numeric table has no comment syntax to hold one. Adding a header would have meant either
+  editing a file this project calls verbatim or teaching the parser to skip something upstream
+  does not have. It now sits beside the licence covering it and the README recording where it came
+  from, which is what `ATOMTYPE_BCC.DEF` was already doing.
+
+- **The provenance notes ship in the wheel.** PEP 639 `license-files` listed
+  `third_party/*/LICENSE` only, so the per-work READMEs were sdist-only — and those are where
+  Apache-2.0 §4(b)'s statement of changes lives, so the clause that needed the binary distribution
+  was the one that did not reach it. Three separate documents meanwhile claimed CI checked for
+  them in the wheel. Both are true now: they are declared in `license-files`, land under
+  `dist-info/licenses/`, and CI fails the release without them.
+
+- **The linked Rust crates had no notices at all, and now have `THIRD_PARTY_LICENSES.md`.**
+  `THIRD_PARTY_NOTICES.md` accounted for the bundled *data* — three parameter tables. It said
+  nothing about the linked *code*, which is 112 crates: `faer`, `rayon`, `libm`, `pyo3` and their
+  transitive dependencies, all statically inside `am1_rs._native` and `am1_rs_cli`. Forty-three
+  are MIT-only, and MIT requires its copyright and permission notice in "all copies or substantial
+  portions of the Software"; a statically linked binary is a copy. The rest are Apache-2.0 or
+  dual, and Apache-2.0 §4(a) requires the licence text. None of it was recorded anywhere, which
+  makes every wheel shipped through 0.2.2 non-compliant with several dozen licences at once — a
+  larger gap than anything in the parameter tables, and invisible next to them.
+
+  The file is **generated**, by `tools/collect_dependency_licenses.py`, from the resolved graph and
+  the licence files in the cargo registry cache: a hand-written list is wrong the first time a
+  dependency changes and nothing fails when it is. Scope is the *normal* dependency closure —
+  `dev-dependencies` are not linked into anything shipped and `build-dependencies` run on the
+  builder's machine. Licence texts are deduplicated by exact content, so two crates share an entry
+  only when their copyright lines match too, which keeps 112 crates in 52 texts without dropping a
+  notice.
+
+  Twelve crates, `faer` among them, publish **no licence file** in their crate tarball at all, so
+  there is no upstream copyright line to reproduce. Those are listed separately with the authors
+  their own manifests declare and the canonical permission notice for the licence they claim —
+  marked as what it is rather than filled in with a plausible-looking copyright line.
+
+  `python tools/collect_dependency_licenses.py --check` regenerates and diffs; CI runs it, so the
+  file has to move with `Cargo.lock`.
+- **`tests/attribution.rs`.** Seven invariants, asserted from the Rust suite rather than only from
+  the release job: every bundled work has both a licence and a provenance note; the notices file
+  accounts for every one of them; `license-files` covers licences *and* notes; `Cargo.toml`
+  excludes neither from the `.crate`; every source file carries an SPDX identifier (119 of them);
+  every embedded data file either has a provenance header or sits beside its licence; and the CI
+  check the prose describes is the one that actually runs. Attribution fails silently — nothing
+  breaks when it goes missing, it just goes missing — which is why it is a test.
+
+- `third_party/mopac/` and `third_party/pyseqm/` gained the per-directory `README.md` that
+  `third_party/antechamber/` already had: which file came from where, under what name, what was
+  ported versus merely cited, and the licence's own requirements. A licence says what the terms
+  are; it does not say which files it covers. `THIRD_PARTY_NOTICES.md` opens with a table of the
+  three bundled works, and CI now fails the release if any `third_party/` subdirectory reaches the
+  sdist without **both** its `LICENSE` and its `README.md`.
+
+- The **RM1** citation (Rocha, Freire, Simas & Stewart, *J. Comput. Chem.* **27**, 1101 (2006))
+  now appears in the crate-level documentation, in `method.rs`, and beside the table it belongs to
+  in `data_tables.rs` — not only in `THIRD_PARTY_NOTICES.md` and `docs/methods.md`.
+
 ## 0.2.2
 
 ### Fixed

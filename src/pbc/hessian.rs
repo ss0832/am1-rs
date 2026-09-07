@@ -55,10 +55,6 @@ use crate::pbc::kpoints::KPoint;
 use crate::pbc::scf::{build_realspace_core, run_pbc_scf, PbcOptions, RealSpaceBlocks};
 use crate::system::Molecule;
 
-/// Convergence tolerance on the CPHF residual, per perturbation.
-const CPHF_TOL: f64 = 1.0e-8;
-/// Iteration cap for the k-point CPHF.
-const CPHF_MAX_ITER: usize = 200;
 /// Occupied–virtual pairs closer than this in energy have their response dropped.
 ///
 /// The orbital-rotation denominator `ε_a − ε_i` vanishes for a degenerate occupied/virtual pair,
@@ -1162,8 +1158,24 @@ fn solve_orbitals(
             }
         }
         // A level is "occupied" for the response if it carries charge, "virtual" if it has room.
-        // With smearing a level can be both, and then it belongs to neither: a rotation inside
-        // the partially filled manifold does not change the density to first order.
+        // A partially filled level is **neither**, and is therefore dropped from the response
+        // entirely — which through 0.2.2 happened silently. That is not a rounding-level error:
+        // the occupied-virtual rotation is the whole orbital-relaxation term, and a level absent
+        // from both sets contributes none of it. Refuse instead, unless asked not to.
+        if options.require_integer_occupations {
+            let (level, distance) =
+                crate::fermi::worst_fractional_occupation(&occupations, occupancy.per_level);
+            if distance > crate::pbc::INTEGER_OCCUPATION_TOL {
+                return Err(crate::error::Am1Error::FractionalOccupation {
+                    k_index: ki,
+                    level,
+                    occupation: occupations[level],
+                    full: occupancy.per_level,
+                    smearing_ev: options.smearing_ev,
+                    path: "coupled-perturbed (CPHF)",
+                });
+            }
+        }
         let mut occ_idx = Vec::new();
         let mut vir_idx = Vec::new();
         for (i, f) in occupations.iter().enumerate() {
@@ -1723,7 +1735,7 @@ fn solve_cphf(
         })
         .collect();
 
-    for iteration in 0..CPHF_MAX_ITER {
+    for iteration in 0..options.cphf_max_iter {
         let mut worst = 0.0_f64;
         // One response density and one response Fock per perturbation, per spin channel.
         let mut next: Vec<Vec<Vec<COv>>> = orbitals
@@ -1805,14 +1817,16 @@ fn solve_cphf(
                 }
             }
         }
-        if worst < CPHF_TOL {
+        if worst < options.cphf_tol {
             return Ok(u);
         }
-        if iteration + 1 == CPHF_MAX_ITER {
+        if iteration + 1 == options.cphf_max_iter {
             return Err(Am1Error::CphfNotConverged {
                 perturbations: ndof,
-                iterations: CPHF_MAX_ITER,
+                iterations: options.cphf_max_iter,
                 residual: worst,
+                // See the note in `pbc::dfpt`: this solver has no curvature test either.
+                unstable: false,
             });
         }
     }

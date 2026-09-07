@@ -112,22 +112,45 @@ def console_script() -> pathlib.Path | None:
 
 
 def rust_cli() -> pathlib.Path | None:
-    """The most recently built `am1_rs_cli`, whichever profile it came from.
+    """The most recently built `am1_rs_cli`, whichever profile and target directory it came from.
 
     By modification time rather than by a fixed profile order: a stale `release` binary left over
     from an earlier version would otherwise shadow the `fast` one being iterated on, and the
     diff below would compare today's Python CLI against last week's Rust one — which reads as a
     parity failure rather than as a stale build.
+
+    `CARGO_TARGET_DIR` is honoured for the same reason. It is set whenever the build is moved off
+    the source tree, which on Windows is the standard workaround for the linker's file locking;
+    without it these tests compare against whatever is left in `./target`, which is exactly the
+    stale-build failure the paragraph above is about.
     """
+    roots = [ROOT / "target"]
+    target = os.environ.get("CARGO_TARGET_DIR")
+    if target:
+        roots.insert(0, pathlib.Path(target))
     candidates = [
-        ROOT / "target" / profile / name
+        root / profile / name
+        for root in roots
         for profile in ("release", "fast", "debug")
         for name in ("am1_rs_cli", "am1_rs_cli.exe")
     ]
     existing = [c for c in candidates if c.exists()]
     if not existing:
         return None
-    return max(existing, key=lambda p: p.stat().st_mtime)
+    newest = max(existing, key=lambda p: p.stat().st_mtime)
+    # A binary older than the sources it was built from is worse than no binary: the parity diff
+    # then reports today's Python CLI against an older Rust one and reads as a broken front end.
+    # This happened — a `./target` left from an earlier session shadowed the `CARGO_TARGET_DIR`
+    # build and turned four passing modes into four failures whose diffs were the 0.2.2 output
+    # format. Skipping says so; comparing does not.
+    sources = [
+        p.stat().st_mtime
+        for d in (ROOT / "src", ROOT / "Cargo.toml")
+        for p in ([d] if d.is_file() else d.rglob("*.rs"))
+    ]
+    if sources and newest.stat().st_mtime < max(sources):
+        return None
+    return newest
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -266,8 +289,21 @@ def test_molden_output_goes_to_a_file_when_asked(tmp_path) -> None:
     result = run_python_cli("molden", str(WATER), "--molden-output", str(out))
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
-    for section in ("[Molden Format]", "[Atoms] Angs", "[STO]", "[MO]"):
+    # `[GTO]` since 0.2.3: `[STO]` describes the AM1 basis exactly and almost no viewer reads it.
+    for section in ("[Molden Format]", "[Atoms] Angs", "[GTO]", "[MO]"):
         assert section in text, f"missing {section}"
+
+    # And the legacy section is still reachable, on demand.
+    legacy = tmp_path / "legacy.molden"
+    result = run_python_cli(
+        "molden", str(WATER), "--molden-basis", "sto", "--molden-output", str(legacy)
+    )
+    assert result.returncode == 0, result.stderr
+    sections = {
+        line.strip() for line in legacy.read_text(encoding="utf-8").splitlines()
+        if line.startswith("[")
+    }
+    assert "[STO]" in sections and "[GTO]" not in sections
 
 
 def test_the_unit_constants_are_the_crate_s_own() -> None:

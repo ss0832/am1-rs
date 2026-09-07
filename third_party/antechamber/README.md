@@ -5,13 +5,20 @@ distributed with **AmberTools**:
 
 | file in this repository | upstream name | what it is |
 |---|---|---|
-| `src/data/bccparm.dat` | `BCCPARM.DAT` | the 405 AM1-BCC bond charge corrections, verbatim |
+| `third_party/antechamber/BCCPARM.DAT` | `BCCPARM.DAT` | the 405 AM1-BCC bond charge corrections, verbatim |
 | `third_party/antechamber/ATOMTYPE_BCC.DEF` | `ATOMTYPE_BCC.DEF` | the AM1-BCC atom-type definition rules, verbatim |
 
-Both are **compiled into every binary and wheel** by `include_str!` — `bccparm.dat` from
+Both are **compiled into every binary and wheel** by `include_str!` — `BCCPARM.DAT` from
 `src/bcc/mod.rs` and `ATOMTYPE_BCC.DEF` from `src/bcc/atomtype.rs`, which interprets its rules
 rather than transcribing them. Neither is read from disk at run time, so the copies here are the
 distributed source of both.
+
+`BCCPARM.DAT` moved here from `src/data/` in 0.2.3. It had been the one embedded data file with
+no provenance anywhere near it: the two parameter CSVs carry a header naming their source, and a
+bare numeric table has no comment syntax to put one in. Adding one would have meant either editing
+a file this document calls verbatim or teaching the parser to skip something upstream does not
+have. Moving it beside the licence and this README achieves the same end and leaves the bytes
+untouched — which is what `ATOMTYPE_BCC.DEF` was already doing.
 
 ## Where they came from
 
@@ -33,8 +40,9 @@ here as `LICENSE`.
 That file is the canonical GPL-3.0 text — the same document this project's own top-level `LICENSE`
 carries, and it is byte-identical to it. It is duplicated here rather than referenced so that the
 requirement is met by anything that unpacks only `third_party/`, and so that
-`pyproject.toml`'s `license-files = [..., "third_party/*/LICENSE"]` glob picks it up and ships it
-inside the wheel.
+`pyproject.toml`'s `license-files` glob picks it up and ships it inside the wheel, together with
+this README. CI checks that every `third_party/` subdirectory carries both and that both reach
+the built wheel.
 
 **On "or later".** The `LICENSE` accompanying the ambermini redistribution is the plain GPL-3 text
 and contains no separate "or (at your option) any later version" grant, so this project does not

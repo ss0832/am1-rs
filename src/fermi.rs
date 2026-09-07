@@ -81,6 +81,30 @@ impl Occupations {
     }
 }
 
+/// How far the *worst* occupation in `occupations` sits from an integer, and which one it is.
+///
+/// `full` is what one orbital holds — 2 for a restricted spin pair, 1 for one unrestricted
+/// channel — so the distance is `min(f, full − f)`, zero for an empty or a filled orbital and
+/// `full/2` at half filling.
+///
+/// # Why this exists as its own function
+///
+/// Two response paths need the identical judgement and reach occupations by different routes: the
+/// CPHF path in `pbc::hessian` fills a k-resolved level list, DFPT fills `k` and `k + q` together.
+/// Written twice, the two would drift, and the cut that matters is not a matter of taste — it is
+/// the point at which the surrounding code stops being able to represent the level. See
+/// [`crate::error::Am1Error::FractionalOccupation`].
+pub fn worst_fractional_occupation(occupations: &[f64], full: f64) -> (usize, f64) {
+    let mut worst = (0usize, 0.0f64);
+    for (i, f) in occupations.iter().enumerate() {
+        let d = f.min(full - f);
+        if d > worst.1 {
+            worst = (i, d);
+        }
+    }
+    worst
+}
+
 /// Fermi–Dirac occupation of a level `x = (ε − μ)/kT`, written to avoid overflow at large |x|.
 #[inline]
 fn fermi_dirac(x: f64) -> f64 {

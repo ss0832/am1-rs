@@ -1,16 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! # am1-rs
 //!
-//! A Rust-native implementation of the **AM1** (Austin Model 1) semiempirical NDDO
-//! quantum-chemistry method, structured after the `gfn1-rs` GFN1-xTB prototype.
+//! A Rust-native implementation of the **AM1** (Austin Model 1) and **RM1** (Recife Model 1)
+//! semiempirical NDDO quantum-chemistry methods, structured after the `gfn1-rs` GFN1-xTB
+//! prototype.
 //!
-//! Provides AM1 heats of formation, Mulliken and **AM1-BCC** partial charges (for
-//! AMBER), analytic nuclear gradients, and L-BFGS geometry optimization. A Python
-//! binding and an ASE `Calculator` are shipped under the `python` feature.
+//! Provides heats of formation, Mulliken and **AM1-BCC** partial charges (for AMBER), analytic
+//! nuclear gradients, CPHF Hessians and infrared spectra, Molden wavefunction output, periodic
+//! boundary conditions with k-points, and L-BFGS geometry optimization for molecules and cells
+//! alike. A Python binding and an ASE `Calculator` are shipped under the `python` feature.
 //!
-//! References: Dewar, Zoebisch, Healy & Stewart, *JACS* **107**, 3902 (1985) (AM1);
-//! Dewar & Thiel, *JACS* **99**, 4899 (1977) (MNDO integrals); Jakalian *et al.*,
-//! *J. Comput. Chem.* **21**, 132 (2000) & **23**, 1623 (2002) (AM1-BCC).
+//! # References
+//!
+//! * **AM1** — M. J. S. Dewar, E. G. Zoebisch, E. F. Healy & J. J. P. Stewart, "AM1: A New
+//!   General Purpose Quantum Mechanical Molecular Model," *J. Am. Chem. Soc.* **107**,
+//!   3902–3909 (1985), plus the AM1 element-extension papers by Dewar and co-workers.
+//! * **RM1** — G. B. Rocha, R. O. Freire, A. M. Simas & J. J. P. Stewart, "RM1: A
+//!   Reparameterization of AM1 for H, C, N, O, P, S, F, Cl, Br and I," *J. Comput. Chem.*
+//!   **27**, 1101–1111 (2006). Identical functional form to AM1; see [`method`] and
+//!   `docs/methods.md`. The machine-readable table shipped here was extracted from MOPAC —
+//!   `third_party/mopac/README.md` records the file, the commit and the licence.
+//! * **MNDO two-centre integrals** — M. J. S. Dewar & W. Thiel, *J. Am. Chem. Soc.* **99**,
+//!   4899 (1977).
+//! * **AM1-BCC** — A. Jakalian, B. L. Bush, D. B. Jack & C. I. Bayly, *J. Comput. Chem.*
+//!   **21**, 132 (2000) and **23**, 1623 (2002).
+//!
+//! `THIRD_PARTY_NOTICES.md` records where every parameter came from and under what licence.
 
 // Index loops over paired arrays are the natural form for the tensor algebra throughout this
 // crate: `for i in 0..3 { for j in 0..3 { h[(off+i, off+j)] += te.e1b[i][j] } }` says what it
@@ -36,6 +51,7 @@ pub mod farfield;
 pub mod fermi;
 pub mod fock;
 pub mod gradient;
+pub mod gto;
 pub mod hamiltonian;
 pub mod hessian;
 pub mod integrals;

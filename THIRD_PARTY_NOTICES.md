@@ -4,6 +4,41 @@
 of the numerical parameters and of the reference formulas the code was ported from, so that
 every parameter's origin is explicit.
 
+## Two different things, in two files
+
+This file covers the **data** this project bundles: parameter tables copied out of PySEQM, MOPAC
+and antechamber, and compiled into every binary.
+
+It does not cover the **code** that is linked in, and that is the larger set. Over a hundred Rust
+crates — `faer`, `rayon`, `libm`, `pyo3` and their transitive dependencies — end up statically
+inside `am1_rs._native` and the `am1_rs_cli` executable, which makes each shipped binary a copy of
+each of them. Most are MIT, which requires its copyright and permission notice to accompany a
+copy; the rest are Apache-2.0 or dual, and Apache-2.0 §4(a) requires its licence text. Those
+notices are in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md), generated from the resolved
+dependency graph by `tools/collect_dependency_licenses.py` so it cannot drift from what is
+actually linked, and shipped in the wheel, the sdist and the `.crate` alongside this file.
+
+Through 0.2.2 that file did not exist and none of those notices were recorded anywhere.
+
+## Bundled works at a glance
+
+Each has its own directory under `third_party/`, holding the full licence text **and** a
+`README.md` that names the specific files taken, the upstream name of each, and what was ported
+versus merely cited. Start there; this file is the cross-cutting account.
+
+| directory | work | licence | what this project takes from it |
+|---|---|---|---|
+| [`third_party/pyseqm/`](third_party/pyseqm/README.md) | PySEQM (LANL) | BSD-3-Clause | the AM1 parameter table, and ported formulas in `params`, `integrals`, `overlap`, `fock`, `repulsion`, `scf` |
+| [`third_party/mopac/`](third_party/mopac/README.md) | MOPAC | Apache-2.0 | the RM1 parameter table, extracted from its Fortran source; the atomic heats of formation; no code |
+| [`third_party/antechamber/`](third_party/antechamber/README.md) | antechamber (AmberTools) | GPL-3.0 | `BCCPARM.DAT` and `ATOMTYPE_BCC.DEF`, both verbatim and both interpreted at run time |
+
+CI fails the release if any `third_party/` subdirectory is missing either its `LICENSE` or its
+`README.md` **in the built wheel**, so a fourth bundled work cannot arrive without both. Both
+reach the wheel through PEP 639 `license-files` and land under `dist-info/licenses/`; the sdist
+carries them in the tree as well. Until 0.2.3 the READMEs were sdist-only and this paragraph
+claimed otherwise -- the check covered the licences alone, which are the clause that is easy to
+satisfy and not the one that carries the attribution.
+
 ## 1. AM1 model parameters (primary scientific sources)
 
 The AM1 per-element parameters — `U_ss, U_pp, ζ_s, ζ_p, β_s, β_p, G_ss, G_sp, G_pp, G_p2,
@@ -16,14 +51,21 @@ constants**, not the creation of this project. Their authoritative sources are:
 - **Halogens and further main-group elements** — the AM1 element-extension papers by Dewar
   and co-workers (F, Cl, Br, I; Al, Si, P, S; Zn, Ge, Hg; …), as consolidated in **MOPAC**
   (J. J. P. Stewart, *Molecular Orbital PACkage*; https://openmopac.github.io/).
-- The isolated-atom average-of-configuration coefficients and the experimental atomic heats
-  of formation reproduce MOPAC's `calpar.f` / `block.f` tables.
+- The isolated-atom average-of-configuration coefficients are written as closed forms in the
+  neutral valence occupation `(n_s, n_p)` rather than transcribed, and reproduce MOPAC's
+  `calpar.f`. `EHEAT_KCAL` in `src/data_tables.rs` tabulates the same experimental heats of
+  formation as MOPAC's `eheat` and mostly agrees with it. `MASS` is **not** MOPAC's table --
+  modern IUPAC standard atomic weights, which differ from MOPAC's older set for a dozen elements.
+  `third_party/mopac/README.md` records what was checked against the upstream tree, including a
+  claim made in 0.2.3 and withdrawn in the same release.
 
 The numerical values are facts drawn from the above literature. The specific machine-readable
 tabulation used here (`src/data/am1_parameters.csv`) was obtained from the PySEQM project
 (see §2); its header line records this.
 
 ## 2. Reference implementation ported: PySEQM (BSD-3-Clause)
+
+File-by-file provenance: [`third_party/pyseqm/README.md`](third_party/pyseqm/README.md).
 
 The following parts of `am1-rs` were **ported from** the PySEQM reference implementation,
 which itself reproduces MOPAC:
@@ -50,6 +92,8 @@ PySEQM:
   clause 1 of that license.
 
 ## 3. RM1 model parameters — MOPAC (Apache-2.0)
+
+File-by-file provenance: [`third_party/mopac/README.md`](third_party/mopac/README.md).
 
 RM1 is a reparameterization of AM1 with an identical functional form:
 
@@ -89,7 +133,10 @@ The AM1-BCC method is due to A. Jakalian, B. L. Bush, D. B. Jack, C. I. Bayly,
 Two antechamber files are used, both verbatim and both compiled into every binary and wheel by
 `include_str!`:
 
-- `src/data/bccparm.dat` — the exact `BCCPARM.DAT`, 405 bond charge corrections.
+- `third_party/antechamber/BCCPARM.DAT` — the exact `BCCPARM.DAT`, 405 bond charge
+  corrections. Moved out of `src/data/` in 0.2.3 so that it sits beside the licence covering it:
+  it is a bare numeric table with no comment syntax, so unlike the parameter CSVs it cannot carry
+  a provenance header without ceasing to be verbatim.
 - `third_party/antechamber/ATOMTYPE_BCC.DEF` — the exact atom-type definition file. Since 0.2.2
   this is not merely "retained for reference": `src/bcc/atomtype.rs` **parses and evaluates it**,
   so it is a source input to the build rather than documentation.
@@ -194,6 +241,23 @@ with GPL-3.0-or-later in the direction used here, and MOPAC's license and copyri
 are retained at `third_party/mopac/LICENSE` and in the header of `src/data/rm1_parameters.csv`.
 The AM1 and RM1 parameter values themselves are published scientific facts and are not
 subject to copyright.
+
+Apache-2.0 §4(b) requires that modified files carry a prominent notice of the change. The
+MOPAC-derived table this project modified is `EHEAT_KCAL` in `src/data_tables.rs`, re-indexed by
+atomic number in 0.2.3; the change and its reason are recorded in `third_party/mopac/README.md`
+under **Modifications**, in the doc comment on the table, and in `CHANGELOG.md`. §4(c) — retaining
+attribution notices — is met by the copyright statement above, by the same statement in
+`third_party/mopac/README.md`, and by the provenance header in `src/data/rm1_parameters.csv`,
+which travels with the data because that file is what `include_str!` compiles in.
+
+**§4(d) is verified and does not apply.** That clause binds only if the upstream Work includes a
+`NOTICE` text file, whose contents would then have to be reproduced here. Checked against a working
+tree at the pinned commit `052691223d19935a89f0fe18cd12301bd83e4201`: `git ls-tree -r HEAD` lists no
+`NOTICE` at any path, and none exists in the checkout. The upstream copyright notice is carried in
+per-file headers instead — every `.F90` opens with `Copyright 2021 Virginia Polytechnic Institute
+and State University` and the Apache boilerplate — which is what §4(c) is satisfied against. Our
+`third_party/mopac/LICENSE` is byte-identical to upstream's, so it is the licence as published,
+unannotated.
 
 **On the antechamber material and "or later".** The licence file accompanying the ambermini
 redistribution is the plain GPL-3 text and carries no separate "or (at your option) any later

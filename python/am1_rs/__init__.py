@@ -18,6 +18,7 @@ __all__ = [
     "divide_conquer",
     "phonons",
     "optimize",
+    "pbc_optimize",
     "frequencies",
     "hessian",
     "am1_bcc",
@@ -41,6 +42,7 @@ pbc_point = native.pbc_point
 divide_conquer = native.divide_conquer
 phonons = native.phonons
 optimize = native.optimize
+pbc_optimize = native.pbc_optimize
 frequencies = native.frequencies
 hessian = native.hessian
 am1_bcc = native.am1_bcc

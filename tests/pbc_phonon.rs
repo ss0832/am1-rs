@@ -91,11 +91,21 @@ fn the_commensurate_q_fold_back_onto_the_supercell_spectrum() {
 
     let fc = ForceConstants::from_supercell(&primitive, &params, &opts, [repeats, 1, 1]).unwrap();
 
-    // Route A: the supercell's own Γ spectrum.
+    // Route A: the supercell's own Γ spectrum — **all** `3N` of it. The identity below is about
+    // the full spectrum, so it uses `all_frequencies_cm` rather than the `3N − 3` vibrations
+    // `frequencies_cm` holds since 0.2.3. (Under a cell the rigid-body subspace is the three
+    // translations only: a rotation is not a symmetry of a periodic structure, and projecting one
+    // out would delete a genuine mode. That count is checked here too, because this test is where
+    // getting it wrong shows up.)
     let supercell = build_supercell(&primitive, [repeats, 1, 1]).unwrap();
-    let mut direct = vibrational_analysis(&supercell, &params, &opts, 1.0e-3)
-        .unwrap()
-        .frequencies_cm;
+    let vib = vibrational_analysis(&supercell, &params, &opts, 1.0e-3).unwrap();
+    assert_eq!(
+        vib.rigid_body_count, 3,
+        "a periodic structure has three rigid-body directions, not six: rotating the cell \
+         contents without rotating the lattice costs energy"
+    );
+    assert_eq!(vib.frequencies_cm.len(), vib.all_frequencies_cm.len() - 3);
+    let mut direct = vib.all_frequencies_cm;
     direct.sort_by(|a, b| a.total_cmp(b));
 
     // Route B: the union over commensurate q of D(q).
@@ -331,4 +341,77 @@ fn a_supercell_along_a_non_periodic_axis_is_refused() {
         message.contains("not periodic"),
         "unhelpful error: {message}"
     );
+}
+
+#[test]
+fn the_mode_vectors_come_back_in_both_conventions() {
+    // `frequencies()` used to be the only way out of a diagonalization that had the eigenvectors
+    // in hand, so learning *what* a mode does meant running the whole calculation again elsewhere.
+    // `modes()` returns them, in the two forms that are actually wanted, and the point of this
+    // test is the relation between the two -- confusing them is a mass-weighting error of
+    // `sqrt(m_a/m_b)`, which looks plausible in a picture and is wrong.
+    let params = Am1Parameters::standard().unwrap();
+    let opts = options();
+    let fc =
+        ForceConstants::from_supercell(&hydrogen_chain(6.0), &params, &opts, [3, 1, 1]).unwrap();
+
+    for q in [
+        gamma(),
+        KPoint {
+            fractional: [0.5, 0.0, 0.0],
+            weight: 1.0,
+        },
+    ] {
+        let m = fc.modes(q).unwrap();
+        let n = 3 * 2;
+        assert_eq!(m.frequencies_cm.len(), n);
+        assert_eq!(m.polarization.re.rows, n);
+        assert_eq!(m.displacements.re.rows, n);
+
+        // `frequencies()` is the same solve with the vectors dropped, so it must agree exactly.
+        for (a, b) in fc.frequencies(q).unwrap().iter().zip(&m.frequencies_cm) {
+            assert!(
+                (a - b).abs() < 1.0e-9,
+                "frequencies() and modes() disagree: {a} vs {b}"
+            );
+        }
+
+        // The polarization is an eigenbasis of a Hermitian matrix: `e^H e = 1`.
+        for i in 0..n {
+            for j in 0..n {
+                let (mut re, mut im) = (0.0, 0.0);
+                for k in 0..n {
+                    let (ar, ai) = (m.polarization.re[(k, i)], -m.polarization.im[(k, i)]);
+                    let (br, bi) = (m.polarization.re[(k, j)], m.polarization.im[(k, j)]);
+                    re += ar * br - ai * bi;
+                    im += ar * bi + ai * br;
+                }
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (re - want).abs() < 1.0e-10 && im.abs() < 1.0e-10,
+                    "polarization is not orthonormal at ({i},{j}): {re} + {im}i"
+                );
+            }
+        }
+
+        // The displacement is `e_a / sqrt(m_a)` and deliberately not renormalized, so that a heavy
+        // and a light atom keep their true relative amplitude. Both atoms here are hydrogen, so
+        // the whole matrix is one scale factor away from the polarization -- which is exactly what
+        // makes the factor checkable without a second source for it.
+        let s = 1.0 / am1_rs::data_tables::atomic_mass(1).unwrap().sqrt();
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    (m.displacements.re[(i, j)] - s * m.polarization.re[(i, j)]).abs() < 1.0e-12
+                );
+                assert!(
+                    (m.displacements.im[(i, j)] - s * m.polarization.im[(i, j)]).abs() < 1.0e-12
+                );
+            }
+        }
+        assert!(
+            s < 1.0,
+            "1/sqrt(m) must shrink the vector; hydrogen is above 1 amu"
+        );
+    }
 }

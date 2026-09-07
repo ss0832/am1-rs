@@ -175,6 +175,39 @@ pub struct DfptOptions {
     /// Whether the long-range monopole (Ewald) term is included in the response.
     pub long_range: LongRange,
     /// Convergence tolerance on the response density's RMS change between iterations.
+    ///
+    /// # It cannot usefully be tighter than the ground state underneath it
+    ///
+    /// The default is `1e-10` while [`PbcOptions::p_tol`] defaults to `1e-7` — three orders
+    /// looser. On most systems that is harmless, because the ground-state SCF stops *well* inside
+    /// its own tolerance and the response has room to converge. On a system where it does not,
+    /// asking for `1e-10` is asking for something the density being differentiated cannot supply,
+    /// and the symptom is a CPSCF that runs to its iteration cap at a residual that will not move.
+    ///
+    /// Rutile GeO₂ is that system, and the measurements are worth recording because the obvious
+    /// explanations are both wrong:
+    ///
+    /// * **Not charge sloshing.** Kerker preconditioning on the response
+    ///   ([`Self::cpscf_kerker_kappa`]) at `κ = 0, 0.05, 0.2, 0.8` moved the worst residual
+    ///   between `1.8e-7` and `5.0e-7` — non-monotonically — and converged none of them.
+    /// * **Not the response solver.** Tightening the *ground state* to `p_tol = 1e-9` or `1e-11`
+    ///   does not help either: the periodic SCF then does not converge at all. GeO₂'s ground state
+    ///   has a floor of its own between `1e-7` and `1e-9`, and the response inherits it.
+    ///
+    /// So the residual floor is the ground state's, seen through the response. There is no setting
+    /// of the response solver that manufactures accuracy the density does not have.
+    ///
+    /// # Why the default is `1e-8` and not `1e-10`
+    ///
+    /// It was `1e-10` through 0.2.2, and spinel ZnAl₂O₄ is what settled that it should not be.
+    /// Its ground state converges without difficulty on the k-point route — 79 iterations at a
+    /// 2×2×2 mesh — and its response then reaches `1.025e-9` and is **refused**, one order short
+    /// of a tolerance three orders tighter than the density it differentiates. That is a
+    /// perfectly converged response thrown away by a number nobody had checked against anything.
+    ///
+    /// `1e-8` is one order inside `p_tol`'s `1e-7`, which is as much as the input supports and
+    /// still far tighter than any use of the force constants requires. Tighten it deliberately if
+    /// a particular identity needs it, and expect stiff systems to refuse.
     pub cpscf_tol: f64,
     /// Iteration cap for the coupled-perturbed self-consistent solve.
     pub cpscf_max_iter: usize,
@@ -185,6 +218,39 @@ pub struct DfptOptions {
     /// Off by default because it is `O(ndof · n_k · nao²)` — the largest array in the
     /// calculation, and one the force constants themselves do not need retained.
     pub keep_response: bool,
+    /// Force the dense or the sparse contraction of `C(q)` instead of choosing by cost.
+    ///
+    /// `None`, the default, calls [`select_contraction`], which compares the two operation counts
+    /// and the memory the dense route would need. Set it only to measure one route against the
+    /// other -- the two compute the same sum in a different order and must agree to roundoff,
+    /// which is what `tests/pbc_dfpt_contraction.rs` checks.
+    pub dense_contraction: Option<bool>,
+    /// Kerker preconditioning on the CPSCF's response residual, at this kappa (eV^-1).
+    ///
+    /// Zero, the default, leaves it off. The response density slosh for the same reason the
+    /// ground-state one does -- long-wavelength charge transfer, damped by `(1 + kappa*gamma)^-1`
+    /// against the same monopole Coulomb kernel; see [`crate::pbc::kerker`]. It is off by default
+    /// because most systems converge without it, and it is **not validated to change any
+    /// outcome**.
+    ///
+    /// It was added for rutile GeO2, whose response runs to the iteration cap. It does not fix
+    /// it. Measured on that system, worst residual after 200 iterations:
+    ///
+    /// ```text
+    /// kappa   0     0.05    0.2     0.8
+    ///       5.0e-7  1.8e-7  3.7e-7  2.6e-7
+    /// ```
+    ///
+    /// A factor of three at one setting, non-monotonic, and no value converges. The reason is in
+    /// [`Self::cpscf_tol`]: that floor is the ground state's, not the response's, so no
+    /// preconditioner of the response can lift it. What the option *is* known to do is leave the
+    /// answer alone — `tests/cpscf_kerker.rs` checks that preconditioning moves the converged
+    /// force constants by 7e-18, which it must, since `(1 + kappa*gamma)^-1` multiplies a residual
+    /// that is zero at the solution.
+    ///
+    /// Kept, off, and documented this way rather than deleted, so that the next person to reach
+    /// for Kerker on this solver finds the measurement instead of repeating it.
+    pub cpscf_kerker_kappa: f64,
 }
 
 impl DfptOptions {
@@ -233,10 +299,12 @@ impl Default for DfptOptions {
             kmesh: None,
             kpoints: None,
             long_range: LongRange::Auto,
-            cpscf_tol: 1.0e-10,
+            cpscf_tol: 1.0e-8,
             cpscf_max_iter: 200,
             cpscf_mixing: 0.7,
             keep_response: false,
+            dense_contraction: None,
+            cpscf_kerker_kappa: 0.0,
         }
     }
 }
@@ -447,21 +515,6 @@ impl ComplexBlocks {
             k += n;
         }
     }
-
-    fn mixed(&self, previous: &Self, mix: f64) -> Self {
-        let mut out = self.clone();
-        for (i, b) in out.re.blocks.iter_mut().enumerate() {
-            for (k, v) in b.as_mut_slice().iter_mut().enumerate() {
-                *v = mix * *v + (1.0 - mix) * previous.re.blocks[i].as_slice()[k];
-            }
-        }
-        for (i, b) in out.im.blocks.iter_mut().enumerate() {
-            for (k, v) in b.as_mut_slice().iter_mut().enumerate() {
-                *v = mix * *v + (1.0 - mix) * previous.im.blocks[i].as_slice()[k];
-            }
-        }
-        out
-    }
 }
 
 /// One `k` of the response mesh, with its partner at `k + q`.
@@ -510,6 +563,15 @@ pub struct DfptResult {
     /// on a 3D cell, the long-range monopole channel's per-atom diagonal; `nao²` grows as `N²`
     /// regardless. That difference is what makes assembling `C(q)` `O(N³ n_k)` instead of
     /// `O(N⁴ n_k)`.
+    ///
+    /// # And it is a claim that can come out false
+    ///
+    /// The counters are worth reading rather than assuming, because on a **small 3D cell** the
+    /// sparse form loses. `bare_nonzeros` sums over every translation inside the real-space
+    /// cutoff, and a small cell admits several hundred of them: rutile GeO₂ reports 110944
+    /// against `nao² = 576`, so the sparse contraction does 190 times the work a dense one would.
+    /// The crossover is `nao² ≈ nnz`, and [`select_contraction`] picks the cheaper side of it per
+    /// calculation instead of assuming which one that is.
     pub bare_nonzeros: usize,
     pub bare_dense_elements: usize,
 }
@@ -534,12 +596,53 @@ pub fn dynamical_matrix_dfpt_with(
     dfpt: &DfptOptions,
     q: KPoint,
 ) -> Result<CMatrix> {
-    let c = force_constants_at_q_with(molecule, params, options, dfpt, q)?.force_constants;
+    let mut c = force_constants_at_q_with(molecule, params, options, dfpt, q)?.force_constants;
+    impose_acoustic_sum_rule_at_gamma(molecule, &mut c, q);
     mass_weight(molecule, &c)
+}
+
+/// At `q = 0`, force `Σ_b C(0)_{aα,bβ} = 0` through the on-site block.
+///
+/// A rigid translation costs no energy, so `C(0)` must annihilate it and three frequencies must be
+/// zero. The response is computed directly at each `q` here — there is no `Φ(T)` to truncate — but
+/// the *ground state* it is built on carries the real-space and exchange cutoffs, and what those
+/// leave behind lands on the acoustic branch. Measured before this correction: wurtzite ZnO came
+/// out with **−80, −80, 0, 0, 0** at Γ, five near-zero modes where there are three, and rutile
+/// GeO₂ with **−166**.
+///
+/// The correction is the standard one and the same the supercell path uses
+/// ([`crate::pbc::phonon::ForceConstants::enforce_acoustic_sum_rule`]): subtract each row's sum
+/// from the on-site block, which is the term least determined by the calculation. It **moves**
+/// the truncation error rather than removing it, and it applies only at `q = 0` because that is
+/// the only `q` where the sum rule is a statement about this matrix — at `q ≠ 0` a uniform
+/// translation is not a solution and there is nothing to impose.
+fn impose_acoustic_sum_rule_at_gamma(molecule: &Molecule, c: &mut CMatrix, q: KPoint) {
+    if q.fractional.iter().any(|f| f.abs() > 1.0e-12) {
+        return;
+    }
+    let nat = molecule.atoms.len();
+    for a in 0..nat {
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut re = 0.0;
+                let mut im = 0.0;
+                for b in 0..nat {
+                    let (r, m) = c.get(3 * a + i, 3 * b + j);
+                    re += r;
+                    im += m;
+                }
+                c.add(3 * a + i, 3 * a + j, -re, -im);
+            }
+        }
+    }
 }
 
 /// Divide a force-constant matrix by `√(m_a m_b)` and convert eV/Bohr² to eV/(Å²·amu).
 fn mass_weight(molecule: &Molecule, c: &CMatrix) -> Result<CMatrix> {
+    // A missing mass here is a division by zero, not a wrong number: it turns every row of that
+    // atom into `±∞` and surfaces as "eigendecomposition failed" from `frequencies_dfpt`, which
+    // is what a fluorite HgF₂ calculation used to report. See `data_tables::MASS`.
+    crate::data_tables::require_masses(molecule)?;
     let nat = molecule.atoms.len();
     let a0_sq = crate::constants::ANGSTROM_TO_BOHR * crate::constants::ANGSTROM_TO_BOHR;
     let mut d = CMatrix::zeros(3 * nat);
@@ -657,7 +760,10 @@ pub fn force_constants_at_q_with(
         ..options.clone()
     };
     let options = &scf_options;
-    let scf = run_pbc_scf(molecule, params, options)?;
+    let scf = {
+        let _t = crate::timing::Timer::start("dfpt:scf");
+        run_pbc_scf(molecule, params, options)?
+    };
     if !scf.converged {
         return Err(Am1Error::InvalidInput(
             "the periodic SCF did not converge; a DFPT response built on it would be meaningless"
@@ -720,9 +826,42 @@ pub fn force_constants_at_q_with(
         nao,
         q,
         fill,
+        // The same monopole Coulomb kernel the ground-state SCF preconditions against, built from
+        // the same pair list and Ewald remainder. It is a property of the geometry, so one object
+        // serves every perturbation and every CPSCF iteration.
+        kerker: if dfpt.cpscf_kerker_kappa > 0.0 {
+            // `LongRangeQ` above holds the *phased* kernel this `q` needs; the preconditioner
+            // wants the unphased `q = 0` one, which is the same object the ground-state SCF
+            // builds. Rebuilding it costs one Ewald sum against a solve that runs thousands of
+            // iterations.
+            let monopole = crate::pbc::ewald::LongRangeMonopole::for_molecule_with(
+                molecule,
+                options
+                    .klopman_ohno_tail
+                    .then_some((params, options.realspace_cutoff)),
+                &neighbors,
+                options.ewald,
+            )?;
+            Some(crate::pbc::kerker::Kerker::new(
+                molecule,
+                params,
+                &pair_ints.pairs,
+                monopole.as_ref().map(|(m, _)| &m.delta),
+                dfpt.cpscf_kerker_kappa,
+            )?)
+        } else {
+            None
+        },
+        origin_index: translations
+            .iter()
+            .position(|t| t.is_origin())
+            .ok_or_else(|| Am1Error::InvalidInput("the translation set has no origin".into()))?,
     };
 
-    let (bare, skeleton) = bare_and_skeleton(&ctx, &scf.density, &channel_refs)?;
+    let (bare, skeleton) = {
+        let _t = crate::timing::Timer::start("dfpt:skeleton");
+        bare_and_skeleton(&ctx, &scf.density, &channel_refs)?
+    };
     let ex_scale = crate::pbc::scf::exchange_scale_for(fill);
     let counts: Vec<f64> = if channel_densities.len() == 2 {
         let (na, nb) = crate::pbc::hessian::spin_populations(molecule, params, options)?;
@@ -734,6 +873,7 @@ pub fn force_constants_at_q_with(
     };
     let mut bands: Vec<Vec<Band>> = Vec::with_capacity(channel_densities.len());
     for (density, count) in channel_densities.iter().zip(&counts) {
+        let _t = crate::timing::Timer::start("dfpt:bands");
         bands.push(solve_bands(
             &ctx,
             &core,
@@ -764,6 +904,9 @@ pub fn force_constants_at_q_with(
         .max()
         .unwrap_or(0);
     let bare_dense_elements = nao * nao;
+    let dense_contraction = dfpt
+        .dense_contraction
+        .unwrap_or_else(|| select_contraction(ndof, kpoints.len(), nao, bare_nonzeros, &bands));
     if crate::timing::enabled() {
         eprintln!(
             "  dfpt: bare perturbation {bare_nonzeros} nonzeros per DOF against \
@@ -802,31 +945,80 @@ pub fn force_constants_at_q_with(
     /// caller asked to keep it.
     type Column = (Vec<[f64; 2]>, Option<Vec<CMatrix>>);
     let keep = dfpt.keep_response;
+    // Bloch-summed once for every `(channel, j, k)` when the dense route was chosen; see
+    // `select_contraction` for the arithmetic that chooses it. `None` keeps the sparse route,
+    // which folds the phase in per entry and holds nothing.
+    let dense_h: Option<Vec<Vec<Vec<CMatrix>>>> = dense_contraction.then(|| {
+        let _t = crate::timing::Timer::start("dfpt:bloch_bare");
+        bare.iter()
+            .enumerate()
+            .map(|(ci, per_dof)| {
+                per_dof
+                    .iter()
+                    .map(|h| bands[ci].iter().map(|b| h.at_k(&b.k)).collect())
+                    .collect()
+            })
+            .collect()
+    });
+    if crate::timing::enabled() {
+        eprintln!(
+            "  dfpt: {} contraction ({bare_nonzeros} nonzeros against {bare_dense_elements} dense)",
+            if dense_contraction { "dense" } else { "sparse" }
+        );
+    }
     let columns: Vec<Result<Column>> = (0..ndof)
         .into_par_iter()
         .map(|jp| {
             // One CPSCF per perturbation, solving **all** spin channels together — they are
             // coupled through the Coulomb half of the kernel.
             let column: Vec<&SparseBare> = bare.iter().map(|per_dof| &per_dof[jp]).collect();
-            let delta = solve_response_channels(&ctx, &bands, &column, ndof, dfpt)?;
+            let delta = {
+                let _t = crate::timing::Timer::start("dfpt:cpscf");
+                solve_response_channels(&ctx, &bands, &column, ndof, dfpt)?
+            };
+            let _t = crate::timing::Timer::start("dfpt:contract");
             let mut col = vec![[0.0_f64; 2]; ndof];
             for (j, acc) in col.iter_mut().enumerate() {
                 // `Σ_σ Σ_k w_k Tr[h⁽¹⁾ʲσ(k)† ΔPʲ'σ(k)]`. Each channel contracts its **own** bare
                 // perturbation against its own response: the two differ by the exchange, and
                 // crossing them would contract `∂F^α/∂R` with `ΔP^β`.
-                for (ci, per_dof) in bare.iter().enumerate() {
-                    for (t, entries) in &per_dof[j].groups {
-                        for (slot, band) in bands[ci].iter().enumerate() {
-                            let (c, s) = band.k.phase(*t);
-                            let w = band.k.weight;
-                            let p = &delta[ci][slot];
-                            for &(mu, nu, v) in entries {
-                                // The Bloch-summed entry, then `conj(h) · ΔP`.
-                                let hr = c * v[0] - s * v[1];
-                                let hi = c * v[1] + s * v[0];
-                                let (pr, pi) = p.get(mu as usize, nu as usize);
-                                acc[0] += w * (hr * pr + hi * pi);
-                                acc[1] += w * (hr * pi - hi * pr);
+                match &dense_h {
+                    // `h_j(k)` already Bloch-summed: the trace is `nao²` per `(j, j', k)` and the
+                    // phase has been paid once per `(j, k)` rather than once per pair.
+                    Some(h) => {
+                        for (ci, per_channel) in h.iter().enumerate() {
+                            for (slot, band) in bands[ci].iter().enumerate() {
+                                let w = band.k.weight;
+                                let (hk, p) = (&per_channel[j][slot], &delta[ci][slot]);
+                                let (hr, hi) = (hk.re.as_slice(), hk.im.as_slice());
+                                let (pr, pi) = (p.re.as_slice(), p.im.as_slice());
+                                let mut re = 0.0;
+                                let mut im = 0.0;
+                                for i in 0..hr.len() {
+                                    re += hr[i] * pr[i] + hi[i] * pi[i];
+                                    im += hr[i] * pi[i] - hi[i] * pr[i];
+                                }
+                                acc[0] += w * re;
+                                acc[1] += w * im;
+                            }
+                        }
+                    }
+                    None => {
+                        for (ci, per_dof) in bare.iter().enumerate() {
+                            for (t, entries) in &per_dof[j].groups {
+                                for (slot, band) in bands[ci].iter().enumerate() {
+                                    let (c, s) = band.k.phase(*t);
+                                    let w = band.k.weight;
+                                    let p = &delta[ci][slot];
+                                    for &(mu, nu, v) in entries {
+                                        // The Bloch-summed entry, then `conj(h) · ΔP`.
+                                        let hr = c * v[0] - s * v[1];
+                                        let hi = c * v[1] + s * v[0];
+                                        let (pr, pi) = p.get(mu as usize, nu as usize);
+                                        acc[0] += w * (hr * pr + hi * pi);
+                                        acc[1] += w * (hr * pi - hi * pr);
+                                    }
+                                }
                             }
                         }
                     }
@@ -846,6 +1038,7 @@ pub fn force_constants_at_q_with(
     let mut response: Vec<Vec<CMatrix>> = Vec::with_capacity(if keep { ndof } else { 0 });
     for (jp, column) in columns.into_iter().enumerate() {
         let (col, kept) = column?;
+
         for (j, acc) in col.iter().enumerate() {
             let (re, im) = total.get(j, jp);
             total.re[(j, jp)] = re + acc[0];
@@ -886,6 +1079,138 @@ pub fn force_constants_at_q_with(
         bare_nonzeros,
         bare_dense_elements,
     })
+}
+
+/// `Δp(T) += Σ_k w_k e^{−ik·T} ΔP(k)` for every translation at once.
+///
+/// # Why this is not the loop it replaced
+///
+/// This is the inverse of the Bloch sum, and it sits at the bottom of the CPSCF — once per spin
+/// channel per iteration per perturbation, which on a phonon run is the innermost thing in the
+/// calculation. Written as a loop over `k` and then over translations it was `n_k · n_T · nao²`
+/// calls to `ComplexBlocks::add`, and **each of those did a hash lookup** to turn the translation
+/// into a block index. On zincblende AlP with a 3×3×3 mesh that is 1.6 million hashed lookups per
+/// iteration per perturbation; measured, `dfpt:cpscf` was **92 %** of a DFPT phonon calculation.
+///
+/// The same arithmetic is two matrix products. Stack `ΔP(k)` as an `n_k × nao²` panel and the
+/// phases as `n_T × n_k` matrices `C = w_k cos(k·T)` and `S = w_k sin(k·T)`; then
+///
+/// ```text
+/// Re Δp = C·Re ΔP + S·Im ΔP
+/// Im Δp = C·Im ΔP − S·Re ΔP
+/// ```
+///
+/// Same flop count, no lookups, and the inner loop is the blocked kernel — the same rewrite, for
+/// the same reason, as `RealSpaceBlocks::bloch_sum_all` on the forward direction.
+///
+/// `matmul_seq`, not `matmul`: the caller runs under a rayon `par_iter` over the `3N`
+/// perturbations, and faer's own threads would contend with that pool for the same workers.
+fn inverse_bloch_into(
+    out: &mut ComplexBlocks,
+    per_k: &[CMatrix],
+    bands: &[Band],
+    translations: &[ImageOffset],
+    nao: usize,
+) {
+    let (n_k, n_t, width) = (bands.len(), translations.len(), nao * nao);
+    if n_k == 0 || n_t == 0 || width == 0 {
+        return;
+    }
+    let mut xr = Matrix::zeros(n_k, width);
+    let mut xi = Matrix::zeros(n_k, width);
+    for (slot, block) in per_k.iter().enumerate().take(n_k) {
+        xr.as_mut_slice()[slot * width..(slot + 1) * width].copy_from_slice(block.re.as_slice());
+        xi.as_mut_slice()[slot * width..(slot + 1) * width].copy_from_slice(block.im.as_slice());
+    }
+    let (mut cos, mut sin) = (Matrix::zeros(n_t, n_k), Matrix::zeros(n_t, n_k));
+    for (ti, t) in translations.iter().enumerate() {
+        for (slot, band) in bands.iter().enumerate() {
+            let (c, s) = band.k.phase(*t);
+            cos[(ti, slot)] = band.k.weight * c;
+            sin[(ti, slot)] = band.k.weight * s;
+        }
+    }
+    let mut re = cos.matmul_seq(&xr);
+    sin.matmul_acc_seq(&xi, &mut re, 1.0);
+    let mut im = cos.matmul_seq(&xi);
+    sin.matmul_acc_seq(&xr, &mut im, -1.0);
+    // `out` was built from the same translation list in the same order, so the block index is the
+    // row index and no lookup is needed here either.
+    for ti in 0..n_t.min(out.re.blocks.len()) {
+        let start = ti * width;
+        for (o, v) in out.re.blocks[ti]
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&re.as_slice()[start..start + width])
+        {
+            *o += *v;
+        }
+        for (o, v) in out.im.blocks[ti]
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&im.as_slice()[start..start + width])
+        {
+            *o += *v;
+        }
+    }
+}
+
+/// Memory the Bloch-summed bare perturbations are allowed to occupy, in bytes.
+///
+/// The dense contraction has to hold `h_j(k)` for every `(channel, j, k)` at once, which is
+/// `n_channels · ndof · n_k · nao² · 2` doubles. That is `O(N⁴)` in the system size, so however
+/// favourable the operation count, there is a size past which it simply must not be built — the
+/// sparse route's memory is `O(N²)` and stays affordable. 512 MB is the cut.
+const DENSE_CONTRACTION_BUDGET: usize = 512 << 20;
+
+/// Whether to Bloch-sum the bare perturbations once and contract densely, or contract sparsely.
+///
+/// # The two costs
+///
+/// The contraction is `Σ_j Σ_j' Σ_k w_k Tr[h⁽¹⁾ʲ(k)† ΔPʲ'(k)]`, and there are two ways to get
+/// `h_j(k)`:
+///
+/// ```text
+/// sparse:  ndof² · n_k · nnz                          phase folded in per entry, per (j, j')
+/// dense:   ndof · n_k · nnz  +  ndof² · n_k · nao²    Bloch-summed once, then contracted
+/// ```
+///
+/// The sparse form pays `nnz` for every *pair* of perturbations; the dense form pays it once per
+/// perturbation and then contracts `nao²`. So dense wins whenever
+/// `ndof · nao² + nnz < ndof · nnz`, which for `ndof > 1` is essentially `nao² < nnz`.
+///
+/// # Why this is chosen rather than assumed
+///
+/// The module was written assuming sparse always wins, and for the systems it was validated on it
+/// does: an H₂ chain has a handful of nonzeros against `nao² = 4`. But `nnz` counts entries over
+/// every translation inside the 40 Bohr real-space cutoff, and a *small* cell admits hundreds of
+/// them — the long-range monopole channel puts a diagonal in each. Rutile GeO₂ measures
+/// `nnz = 110944` against `nao² = 576`, so the "sparse" route does 190 times the work of the
+/// dense one, on the calculation that dominates a phonon run. Both regimes are real, the
+/// crossover is a comparison of two numbers already in hand, and neither answer is right for
+/// every cell.
+fn select_contraction(
+    ndof: usize,
+    n_k: usize,
+    nao: usize,
+    nnz: usize,
+    bands: &[Vec<Band>],
+) -> bool {
+    if ndof < 2 || nnz <= nao * nao {
+        return false;
+    }
+    let bytes = bands
+        .len()
+        .saturating_mul(ndof)
+        .saturating_mul(n_k)
+        .saturating_mul(nao)
+        .saturating_mul(nao)
+        .saturating_mul(2 * std::mem::size_of::<f64>());
+    if bytes > DENSE_CONTRACTION_BUDGET {
+        return false;
+    }
+    // `ndof · nao² + nnz < ndof · nnz`, written without the common `n_k` factor.
+    ndof * nao * nao + nnz < ndof * nnz
 }
 
 /// The response k-set: whatever the caller asked for, resolved **unfolded**.
@@ -946,6 +1271,10 @@ struct DfptContext<'a> {
     /// Electrons one orbital holds: `2` restricted, `1` per unrestricted channel. See
     /// [`crate::pbc::scf::spin_channel_densities`].
     fill: f64,
+    /// Kerker preconditioner for the response residual, when one was asked for.
+    kerker: Option<crate::pbc::kerker::Kerker>,
+    /// Index of the origin block in `translations`, where the atomic charge lives.
+    origin_index: usize,
 }
 
 /// Ground-state bands at every `k` and its partner `k + q`, filled against one chemical potential.
@@ -1062,12 +1391,40 @@ fn solve_bands(
     let mut bands = Vec::with_capacity(n_k);
     for (slot, (k, a, b)) in raw.into_iter().enumerate() {
         // Electrons per filled orbital, matching the normalization of this channel's `P`.
-        let occ_k = (0..nao)
+        let occ_k: Vec<f64> = (0..nao)
             .map(|i| channel.fill * filled.fractions[slot * nao + i])
             .collect();
-        let occ_kq = (0..nao)
+        let occ_kq: Vec<f64> = (0..nao)
             .map(|i| channel.fill * filled.fractions[(n_k + slot) * nao + i])
             .collect();
+        // DFPT fails differently from the CPHF path and just as quietly: it keeps every band pair
+        // and weights it by `f_n(k) − f_m(k+q)`, but those occupations are **frozen**. There is no
+        // `∂f/∂ε` term, so the Fermi surface cannot redistribute charge under the perturbation,
+        // and on a partially filled band the small denominators that term exists to cure are the
+        // ones that dominate. Same refusal, different sentence in the message.
+        if options.require_integer_occupations {
+            for (which, occ) in [(&occ_k, 0usize), (&occ_kq, 1usize)]
+                .iter()
+                .map(|(o, w)| (*w, *o))
+            {
+                let (level, distance) =
+                    crate::fermi::worst_fractional_occupation(occ, channel.fill);
+                if distance > crate::pbc::INTEGER_OCCUPATION_TOL {
+                    return Err(crate::error::Am1Error::FractionalOccupation {
+                        k_index: slot,
+                        level,
+                        occupation: occ[level],
+                        full: channel.fill,
+                        smearing_ev: options.smearing_ev,
+                        path: if which == 0 {
+                            "DFPT (at k)"
+                        } else {
+                            "DFPT (at k+q)"
+                        },
+                    });
+                }
+            }
+        }
         bands.push(Band {
             k,
             eps_k: a.values,
@@ -1251,23 +1608,20 @@ impl LongRangeQ {
 }
 
 /// DIIS depth for the coupled-perturbed response.
-const CPSCF_DIIS_DEPTH: usize = 10;
-
-/// Pulay coefficients for a set of flattened fixed-point residuals.
 ///
 /// The response iteration is a linearly mixed fixed point, and on a dense polar cell it converges
 /// slowly enough to hit the iteration cap: a water crystal needed more than 200 passes to reach
 /// `1e-10`, stalling at `5.6e-9`. Each of those passes is a real-space two-electron build plus a
 /// diagonalization per k point, so the count is the whole cost.
 ///
-/// Normalised and ridged for the same reason [`crate::hessian`]'s CPHF DIIS is: the residuals
-/// span many orders of magnitude over the solve, and an unscaled `B` matrix goes numerically
-/// singular long before the history is actually redundant — at which point the pivot guard
-/// (correctly) refuses it and the acceleration silently stops happening.
-fn cpscf_diis_coeffs(residuals: &[Vec<f64>]) -> Option<Vec<f64>> {
-    let refs: Vec<&[f64]> = residuals.iter().map(|r| r.as_slice()).collect();
-    crate::pbc::scf::pulay_coefficients(&refs)
-}
+/// The Pulay solve itself is [`crate::pbc::scf::PulayGram`], which carries the residual Gram
+/// matrix between iterations rather than rebuilding it: at this depth that is ten dot products a
+/// pass instead of fifty-five, over vectors as long as the real-space response. Normalised and
+/// ridged for the same reason [`crate::hessian`]'s CPHF DIIS is: the residuals span many orders of
+/// magnitude over the solve, and an unscaled `B` matrix goes numerically singular long before the
+/// history is actually redundant — at which point the pivot guard (correctly) refuses it and the
+/// acceleration silently stops happening.
+const CPSCF_DIIS_DEPTH: usize = 10;
 
 /// Solve the self-consistent response, returning `ΔP(k)` per perturbation per k point.
 /// Solve the CPSCF at this `q` for one perturbation, over **all** spin channels together.
@@ -1308,6 +1662,9 @@ fn solve_response_channels(
     let mut converged = false;
     let mut last_residual = f64::INFINITY;
     let mut trials: Vec<Vec<f64>> = Vec::with_capacity(CPSCF_DIIS_DEPTH);
+    // The Gram matrix of the residual history, carried between iterations: only the newest row
+    // is new each pass. See crate::pbc::scf::PulayGram.
+    let mut gram = crate::pbc::scf::PulayGram::new();
     let mut resid_history: Vec<Vec<f64>> = Vec::with_capacity(CPSCF_DIIS_DEPTH);
 
     for iteration in 0..dfpt.cpscf_max_iter {
@@ -1322,6 +1679,7 @@ fn solve_response_channels(
             }
             let mut out = Vec::with_capacity(channels.len());
             for spin in &delta_p {
+                let _t = crate::timing::Timer::start("cpscf:kernel");
                 out.push(fock_response_q(ctx, &total, spin, scale)?);
             }
             Some(out)
@@ -1346,7 +1704,10 @@ fn solve_response_channels(
                     }
                 }
                 // Band basis: rows at `k + q`, columns at `k`.
-                let projected = adjoint_mul(&band.c_kq, &mul(&potential, &band.c_k));
+                let projected = {
+                    let _t = crate::timing::Timer::start("cpscf:to_mo");
+                    adjoint_mul(&band.c_kq, &mul(&potential, &band.c_k))
+                };
 
                 // Every band pair, not occupied × virtual. `f_n(k) − f_m(k+q)` selects them, and
                 // it is nonzero in both directions — the empty→occupied half is the antiresonant
@@ -1368,29 +1729,23 @@ fn solve_response_channels(
                         response.im[(m, n)] = df * im / de;
                     }
                 }
-                let ao = mul(&band.c_kq, &mul_adjoint(&response, &band.c_k));
-                per_k[ci][slot] = ao.clone();
-
-                // Back to real space for the kernel: `Δp(T) = Σ_k w_k e^{−ik·T} ΔP(k)`.
-                let w = band.k.weight;
-                for t in translations {
-                    let (c, s) = band.k.phase(*t);
-                    for i in 0..nao {
-                        for j in 0..nao {
-                            let (xr, xi) = ao.get(i, j);
-                            // e^{−ik·T}(xr + i xi)
-                            next[ci].add(*t, i, j, [w * (xr * c + xi * s), w * (xi * c - xr * s)]);
-                        }
-                    }
-                }
+                let _t = crate::timing::Timer::start("cpscf:to_ao");
+                per_k[ci][slot] = mul(&band.c_kq, &mul_adjoint(&response, &band.c_k));
             }
+            // Back to real space for the kernel, for the whole mesh at once:
+            // `Δp(T) = Σ_k w_k e^{−ik·T} ΔP(k)`. See `inverse_bloch_into` for why this is not the
+            // loop it replaced.
+            let _t = crate::timing::Timer::start("cpscf:inverse_bloch");
+            inverse_bloch_into(&mut next[ci], &per_k[ci], bands, translations, nao);
         }
 
-        let residual = next
-            .iter()
-            .zip(&delta_p)
-            .map(|(a, b)| a.rms_diff(b))
-            .fold(0.0_f64, f64::max);
+        let residual = {
+            let _t = crate::timing::Timer::start("cpscf:residual");
+            next.iter()
+                .zip(&delta_p)
+                .map(|(a, b)| a.rms_diff(b))
+                .fold(0.0_f64, f64::max)
+        };
         last_residual = residual;
         if iteration > 0 && residual < dfpt.cpscf_tol {
             converged = true;
@@ -1405,17 +1760,42 @@ fn solve_response_channels(
         //
         // The channels are extrapolated **together**, on one concatenated vector: they are
         // coupled, so a separate history per channel would let them take inconsistent steps.
+        let _tmix = crate::timing::Timer::start("cpscf:mix");
         let trial: Vec<f64> = next.iter().flat_map(|b| b.as_flat()).collect();
         let previous: Vec<f64> = delta_p.iter().flat_map(|b| b.as_flat()).collect();
-        let residual_vec: Vec<f64> = trial.iter().zip(&previous).map(|(a, b)| a - b).collect();
+        let mut residual_vec: Vec<f64> = trial.iter().zip(&previous).map(|(a, b)| a - b).collect();
+        // Kerker, on the residual the mixer steps along and never on `residual` above, which has
+        // already been measured. The response density sloshes for the same reason the ground-state
+        // one does — long-wavelength charge transfer against the same Coulomb kernel — and only
+        // the origin block carries atomic charge, so only it is damped. Both its real and its
+        // imaginary halves: away from `q = 0` the charge response is complex, and `γ` is real, so
+        // the same operator applies to each.
+        if let Some(k) = ctx.kerker.as_ref() {
+            let width = nao * nao;
+            let per_channel = residual_vec.len() / delta_p.len();
+            let mut scratch = Matrix::zeros(nao, nao);
+            for ci in 0..delta_p.len() {
+                for half in 0..2 {
+                    let start =
+                        ci * per_channel + half * (per_channel / 2) + ctx.origin_index * width;
+                    scratch
+                        .as_mut_slice()
+                        .copy_from_slice(&residual_vec[start..start + width]);
+                    k.apply(&mut scratch, ctx.basis);
+                    residual_vec[start..start + width].copy_from_slice(scratch.as_slice());
+                }
+            }
+        }
         if trials.len() == CPSCF_DIIS_DEPTH {
             trials.remove(0);
             resid_history.remove(0);
+            gram.drop_oldest();
         }
         trials.push(trial);
-        resid_history.push(residual_vec);
+        resid_history.push(residual_vec.clone());
 
-        match cpscf_diis_coeffs(&resid_history) {
+        let refs: Vec<&[f64]> = resid_history.iter().map(|r| r.as_slice()).collect();
+        match gram.push_and_solve(&refs) {
             Some(c) => {
                 let mut combined = vec![0.0; trials[0].len()];
                 for (i, ci) in c.iter().take(trials.len()).enumerate() {
@@ -1429,8 +1809,18 @@ fn solve_response_channels(
                 }
             }
             None => {
+                // `previous + mix · residual`, not `mixed(next, mix)`: the two are the same step
+                // only when the residual has not been preconditioned, and above it may have been.
+                // Recomputing `next − previous` here would quietly discard that.
+                let per_channel = residual_vec.len() / delta_p.len();
                 for (ci, block) in delta_p.iter_mut().enumerate() {
-                    *block = next[ci].mixed(block, dfpt.cpscf_mixing);
+                    let span = ci * per_channel..(ci + 1) * per_channel;
+                    let stepped: Vec<f64> = previous[span.clone()]
+                        .iter()
+                        .zip(&residual_vec[span])
+                        .map(|(p, r)| p + dfpt.cpscf_mixing * r)
+                        .collect();
+                    block.set_from_flat(&stepped);
                 }
             }
         }
@@ -1442,6 +1832,9 @@ fn solve_response_channels(
             perturbations: ndof,
             iterations: dfpt.cpscf_max_iter,
             residual: last_residual,
+            // This is a fixed-point solve with no curvature test, so it cannot distinguish an
+            // unstable reference from a stiff one and does not claim to.
+            unstable: false,
         });
     }
     Ok(per_k)

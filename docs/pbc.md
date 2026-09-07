@@ -127,6 +127,153 @@ therefore bounds `|T|`, and every pair of an admitted translation is included.
 
 ---
 
+## Which phonon route to use, and why it matters
+
+There are two, and they do **not** share an SCF:
+
+| route | SCF | k-sampling | smearing |
+|---|---|---|---|
+| frozen phonon (`phonons`, `ForceConstants::from_supercell`) | the **molecular** solver, run on a supercell | Γ of the supercell only | **none** — `Am1Options` has no smearing |
+| DFPT (`dfpt`) | the **k-point** solver | whatever `kpts` says | `smearing_ev`, since 0.2.3 |
+
+For a **molecular** solid the frozen-phonon route is the right one and is well behaved:
+polyethylene reproduces every measured band to 1.5–5.3 %, the cubic perovskite NH₄ZnF₃ comes out
+with every symmetry-required degeneracy exact, and dimethylzinc's Zn–C stretches land within 6 %.
+
+For a **dense inorganic** solid it is not, and the failure looks like an SCF problem when it is a
+sampling one. Zincblende AlP converges in 31 iterations on a 4×4×4 k-mesh and does not converge at
+all at 1×1×1 or 2×2×2 — and the supercell route is 1×1×1 by construction. Use DFPT there:
+
+```python
+r = am1_rs.dfpt(Z, xyz, cell, pbc, q_points=[[0, 0, 0]], kpts=(6, 6, 6))
+```
+
+Through 0.2.3 this example read `kpts=(4, 4, 4), smearing_ev=0.2`, and two things were wrong with
+it. `native.dfpt` never forwarded `smearing_ev` to the binding, so the run was unsmeared whatever
+you passed; and once it *was* forwarded, that combination is
+[refused](#fractional-occupations-are-refused-not-approximated) — AlP at `kT = 0.2` leaves `2e-6`
+of an electron in a band the CPHF classifier can place in neither the occupied nor the virtual set.
+A 6×6×6 mesh with no smearing is accepted and is where AlP's reported frequencies come from
+(`459 / 459 / 563` cm⁻¹). Smearing remains the right tool where it works — cubic BN at 4×4×4 and
+`smearing_ev = 0.3` is accepted, measured.
+
+The difference is not marginal. On rocksalt ZnO at Γ, DFPT returns the threefold-degenerate
+optical mode the cubic symmetry requires (`475.8, 475.8, 496.4`) where a 2×2×2 supercell breaks it
+(`493.5, 499.8, 547.9`), and at the zone boundary the supercell route produces spurious imaginary
+branches that DFPT does not. That is expected: an ionic `Φ(T)` has an `R⁻³` dipole tail, so no
+affordable supercell is converged, while DFPT truncates nothing in real space.
+
+**What smearing does and does not do.** It converges the *ground state* on a coarse mesh, and that
+is not a small thing: cubic BN at a 4×4×4 mesh does not converge at all with sharp filling and
+takes 92 iterations at `smearing_ev = 0.3`. What it does not do is make a metal describable — the
+coupled-perturbed equations built on top assume integer occupations, so this is a way to reach a
+converged *insulating* state on a mesh you can afford.
+
+Since 0.2.3 that distinction is enforced rather than described: the response checks the
+**converged occupations** and refuses if they are fractional. It does not check the smearing width,
+so BN at `kT = 0.3` — a gapped state reached with smearing — is accepted, which is the whole point.
+See [Fractional occupations](#fractional-occupations-are-refused-not-approximated).
+
+Where smearing does not help, the mesh usually does: the same BN converges in 46 iterations at
+6×6×6 with no smearing at all, and its DFPT phonons come out at Γ as `0, 0, 0, 1084, 1139, 1139`
+against a measured TO of 1055 cm⁻¹ — 2.8 %. At 4×4×4 the response does not converge at any
+smearing width. **Try the mesh before the smearing.**
+
+**Reading an acoustic branch.** Three frequencies are zero at `q = 0`, guaranteed by the sum rule
+— but they are not necessarily the three *lowest*. A structure that is not a minimum has genuinely
+imaginary modes that sort below them: wurtzite ZnO comes out `−80, −80, 0, 0, 0` and rutile GeO₂
+`−166, 0, 0, 0, 95, …`, both of which are three zeros plus an instability, not a broken sum rule.
+Check for three entries **at** zero, not at the front of the sorted list.
+
+**Where AM1 itself runs out.** `max_image_overlap` is the diagnostic: NDDO's working equations
+assume an atom has no overlap with its own periodic images, and it is 0.29 for polyethylene, 0.33
+for graphene and 0.20 for AlP. Bulk diamond's k-point SCF does not converge at all. A model fitted
+to molecules is being asked about a covalent solid, and it says so.
+
+**Following a mode.** Both routes return eigenvectors since 0.2.3 — `eigenvectors=True` on
+`phonons`, `ForceConstants::modes` in Rust — in two conventions, `polarization` (orthonormal, for
+sums over modes) and `displacements` (`e_a/√m_a`, for moving a structure). Use `displacements` to
+follow an imaginary mode downhill and re-relax; that is how this release established that
+Al₂(CH₃)₆'s two imaginary modes are a genuine index-2 saddle, 6.96 eV above a minimum at which AM1
+has dissociated the methyl bridges entirely.
+
+## The SCF when it will not converge
+
+`PbcOptions::adaptive` (on by default) watches the residual and switches strategy, because the two
+ways a periodic SCF fails are distinguishable from the trace and need opposite remedies:
+
+| what the trace does | what it means | what the controller does |
+|---|---|---|
+| grows, or oscillates | charge sloshing — long-wavelength charge transfer overshooting | Kerker preconditioning, mixing to 0.1, DIIS history discarded |
+| decays at a ratio above 0.99 | a near-degenerate Fermi level | raise the electronic temperature, then **anneal it back** |
+| falls steadily | nothing is wrong | Pulay/DIIS at a mixing of 0.3 |
+
+The annealing is the part that matters for the number you get. Smearing changes the **fixed
+point**, not merely the path to it — a system's converged energy at 0.5 eV is not its energy at
+0.05 eV — so the temperature is walked back down and convergence is not accepted until the
+requested smearing is restored. A result that says `converged` converged at the smearing you asked
+for.
+
+`PbcResult::fallback` reports what happened: `kerker_kappa`, `final_mixing`, `max_smearing_ev` and
+`diis_resets`. Read `max_smearing_ev` — a system that needed 1 eV to move at all is telling you
+something about its Fermi surface, and that should not be invisible in a converged result.
+
+**Kerker, without a plane-wave grid.** The usual factor `A(q) = q²/(q² + q₀²)` indexes the density
+by `q`; here the density is real-space blocks over an atom-centred basis, and transforming over the
+lattice-translation index instead projects onto far fewer k-points than translations, throwing most
+of the residual away. Written against the Coulomb kernel the same function is `A = (1 + κγ)⁻¹` with
+`κ = q₀²/4π`, and that form needs nothing plane-wave-specific: NDDO's monopole kernel `γ_ab` is the
+atom-resolved Coulomb interaction and is already assembled. It is applied to the **net charge per
+atom only** — intra-atomic rehybridization and bond-order changes are short-ranged, are not what
+sloshes, and damping them would slow every system down to fix a few.
+
+None of this rescues a system outside NDDO's domain. Where `max_image_overlap` says the model does
+not apply, the fallback will report a large `max_smearing_ev` and still not converge, which is the
+correct outcome.
+
+### Fractional occupations are refused, not approximated
+
+A converged ground state is not enough to make a **response** meaningful. Every response path here
+— the `q = 0` Hessian, `Z*`, `ε_∞`, the polarizability, DFPT — is derived at fixed integer
+occupation. There is no `∂f/∂ε` term anywhere in the coupled-perturbed equations, so the Fermi
+surface cannot redistribute charge under the perturbation, and a partially filled band is a term
+the equations **do not have** rather than a small error in the answer.
+
+Through 0.2.2 both paths ran regardless, and each went wrong in its own quiet way:
+
+| path | what it does with a partially filled band |
+|---|---|
+| CPHF (`pbc_hessian`, `born_charges`, `dielectric`, `polarizability`) | classifies each band as occupied (`f > full − 1e-6`) or virtual (`f < 1e-6`); a band between the two is **neither**, so it is dropped from the response entirely |
+| DFPT | keeps every band pair, but weights each by a **frozen** `f_n(k) − f_m(k+q)` |
+
+Both now raise `Am1Error::FractionalOccupation` (a `ValueError` in Python), naming the k-point, the
+band, the occupation and the smearing.
+
+**Smearing is not what is refused.** This matters, because smearing is exactly what the section
+above tells you to reach for on a dense inorganic solid. The judgement is on the *converged
+occupations*, not on `smearing_ev > 0`: a gapped system's conduction band holds about
+`exp(−gap/2kT)` electrons, which crosses `1e-6` only when the gap falls under roughly `27·kT`.
+Measured, in `tests/fractional_occupations.rs`:
+
+```text
+cubic BN,       4x4x4, kT = 0.3   accepted     <- the case docs recommend
+cubic BN,       6x6x6, kT = 0     accepted
+zincblende AlP, 6x6x6, kT = 0     accepted     <- the mesh AlP's reported frequencies use
+zincblende AlP, 4x4x4, kT = 0.2   REFUSED, worst fractional occupation 1.794e-6
+zincblende AlP, 6x6x6, kT = 0.2   REFUSED, 1.957e-6
+```
+
+AlP under smearing refusing at `2e-6` looks like a threshold worth loosening, and it is not. At
+`2e-6` the classifier puts that band in neither set, so the CPHF response omits **the whole band**;
+the cut is not an accuracy tolerance but the exact point at which the code stops being able to
+represent the level, which is why `INTEGER_OCCUPATION_TOL` is a constant and the way out is a
+yes/no. The remedy for AlP is the one this document already gives — 6×6×6 with no smearing.
+
+**If you want the old number anyway**, `PbcOptions::require_integer_occupations = false`, or
+`allow_fractional_occupations=True` on the Python response entry points, or
+`AM1(allow_fractional_occupations=True)`. It is a boolean and not a tolerance because the choice is
+between an error and a known-wrong answer, not between two accuracies.
+
 ## Limitations
 
 ### The exchange taper
@@ -540,6 +687,8 @@ real-space, and the argument here about which ranks need reciprocal treatment in
 dimensionality is unchanged.
 
 <a id="the-r3-tail"></a>
+<a id="the-r3-tail"></a>
+
 ### The `R⁻³` tail
 
 The note above concluded that fixing this needs "the generalized Ewald machinery for that channel
@@ -603,7 +752,7 @@ and the remainder is crude. The explicit sum in step 1 is what makes this a boun
 than a wrong one, but a dilute cell is where this correction is least trustworthy, and the honest
 statement is that it is a continuum estimate there rather than a lattice sum.
 
-### Not implemented, as of 0.2.2
+### Not implemented, as of 0.2.3
 
 This list was stale through 0.2.0 — it still named Ewald summation, the periodic Hessian, phonons,
 DFPT and periodic divide-and-conquer as missing, all of which 0.2.0 shipped. Struck-through
@@ -674,6 +823,19 @@ What is genuinely absent:
   Born charges, **DFPT at finite `q`**, and `ε_∞`/the polarizability. Still restricted: the Berry
   phase and the finite field built on it.
 - ~~**Open-shell analytic stress**~~ ✅ since 0.2.2 — the spin-resolved pair virial.
+- ~~**Phonon eigenvectors.**~~ ✅ since 0.2.3 — `eigenvectors=True`, `ForceConstants::modes`. Both
+  routes, both conventions (`polarization` and `displacements`); see
+  [Which phonon route to use](#which-phonon-route-to-use-and-why-it-matters).
+- **A metal** — and since 0.2.3 the response says so instead of answering. Smearing converges a
+  *ground state* on a coarse mesh, and that is all it does: the coupled-perturbed equations above
+  it carry no `∂f/∂ε` term, so the Fermi surface cannot respond to the perturbation and every
+  response property — the Hessian, `Z*`, `ε_∞`, DFPT — is defined only for a gapped system. See
+  [Fractional occupations](#fractional-occupations-are-refused-not-approximated) below for what
+  is refused, what is not, and the measurements.
+- **The layered rocksalt, and AlP through the supercell route**, do not reach a converged SCF at
+  any setting tried, including the full fallback pipeline. The structures were verified before the
+  runs — coordination checked per site — so this is the model or the solver, not a mis-built cell.
+  Recorded rather than worked around.
 - **SAM1.** A different integral engine, not a reparameterization; AM1 and RM1 are available.
 
 ### The conversion is a depolarization problem
@@ -814,3 +976,8 @@ between them — an apparently large stress "error" is usually this.
 | `e_tol`, `p_tol` | `1e-8`, `1e-7` | SCF thresholds; tighten for finite differences |
 | `max_scf` | `300` | Not converging raises, rather than returning a bad result |
 | `mixing` | `0.3` | Linear mixing of the real-space density |
+| `diis_history` | `8` | Pulay depth; `0` restores plain linear mixing |
+| `adaptive` | `true` | The fallback pipeline above. `false` restores the 0.2.2 behaviour: SAD, Pulay, iteration limit |
+| `kerker_kappa` | `0.0` | Kerker from the first iteration, eV⁻¹. `0.0` leaves it to `adaptive` to engage on demand; set it for a system already known to slosh |
+| `cphf_max_iter`, `cphf_tol` | `200`, `1e-8` | The **response** solve's limits, separate from `max_scf` because it is a different fixed point |
+| `electric_field` | `None` | Orthogonal to every lattice vector; reaches `pbc_optimize` since 0.2.3 |

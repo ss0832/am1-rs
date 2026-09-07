@@ -33,6 +33,89 @@ impl Default for OptOptions {
     }
 }
 
+/// Limited-memory BFGS memory and its two-loop recursion.
+///
+/// Split out of [`optimize`] so that [`crate::pbc::optimizer`] can relax a periodic cell with the
+/// same quasi-Newton step rather than a second copy of it. The recursion is the textbook one; what
+/// is worth stating is the two guards, both of which are in it because they were needed:
+///
+/// * the initial scaling on an **empty** history is `0.1 / max|g|`, a deliberately short first
+///   step — a plain `H₀ = I` moves an atom by the full gradient in eV/Bohr, which for a bad
+///   starting geometry is several Bohr;
+/// * a curvature pair is only stored when `sᵀy > 0`, because a non-positive one would make the
+///   implicit Hessian indefinite and the next direction uphill.
+#[derive(Clone, Debug)]
+pub struct Lbfgs {
+    s: Vec<Vec<f64>>,
+    y: Vec<Vec<f64>>,
+    rho: Vec<f64>,
+    history: usize,
+}
+
+impl Lbfgs {
+    pub fn new(history: usize) -> Self {
+        Self {
+            s: Vec::new(),
+            y: Vec::new(),
+            rho: Vec::new(),
+            history: history.max(1),
+        }
+    }
+
+    /// The quasi-Newton search direction `−H g`, guaranteed to be downhill.
+    pub fn direction(&self, g: &[f64], max_grad: f64) -> Vec<f64> {
+        let mut q = g.to_vec();
+        let m = self.s.len();
+        let mut alpha = vec![0.0; m];
+        for i in (0..m).rev() {
+            let a = self.rho[i] * dot(&self.s[i], &q);
+            alpha[i] = a;
+            axpy(&mut q, -a, &self.y[i]);
+        }
+        let gamma = if m > 0 {
+            let sy = dot(&self.s[m - 1], &self.y[m - 1]);
+            let yy = dot(&self.y[m - 1], &self.y[m - 1]);
+            if yy > 0.0 {
+                sy / yy
+            } else {
+                1.0
+            }
+        } else {
+            // Cautious first step.
+            0.1 / max_grad.max(1.0e-6)
+        };
+        for v in q.iter_mut() {
+            *v *= gamma;
+        }
+        for i in 0..m {
+            let beta = self.rho[i] * dot(&self.y[i], &q);
+            axpy(&mut q, alpha[i] - beta, &self.s[i]);
+        }
+        let mut d: Vec<f64> = q.iter().map(|v| -v).collect();
+        // Guard against uphill directions.
+        if dot(&d, g) > 0.0 {
+            d = g.iter().map(|v| -v).collect();
+        }
+        d
+    }
+
+    /// Record a curvature pair, dropping it when it would make the implicit Hessian indefinite.
+    pub fn push(&mut self, s: Vec<f64>, y: Vec<f64>) {
+        let sy = dot(&s, &y);
+        if sy <= 1.0e-10 {
+            return;
+        }
+        self.s.push(s);
+        self.y.push(y);
+        self.rho.push(1.0 / sy);
+        if self.s.len() > self.history {
+            self.s.remove(0);
+            self.y.remove(0);
+            self.rho.remove(0);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OptStep {
     pub energy_ev: f64,
@@ -67,9 +150,7 @@ pub fn optimize(
     let mut scf = grad0.scf;
     let mut max_grad = grad0.max_gradient;
 
-    let mut s_hist: Vec<Vec<f64>> = Vec::new();
-    let mut y_hist: Vec<Vec<f64>> = Vec::new();
-    let mut rho_hist: Vec<f64> = Vec::new();
+    let mut memory = Lbfgs::new(opt.history);
 
     let mut trajectory = vec![OptStep {
         energy_ev: energy,
@@ -87,40 +168,7 @@ pub fn optimize(
             break;
         }
 
-        // L-BFGS two-loop recursion -> search direction d = -H*g.
-        let mut q = g.clone();
-        let m = s_hist.len();
-        let mut alpha = vec![0.0; m];
-        for i in (0..m).rev() {
-            let a = rho_hist[i] * dot(&s_hist[i], &q);
-            alpha[i] = a;
-            axpy(&mut q, -a, &y_hist[i]);
-        }
-        // Initial Hessian scaling.
-        let gamma = if m > 0 {
-            let sy = dot(&s_hist[m - 1], &y_hist[m - 1]);
-            let yy = dot(&y_hist[m - 1], &y_hist[m - 1]);
-            if yy > 0.0 {
-                sy / yy
-            } else {
-                1.0
-            }
-        } else {
-            // Cautious first step.
-            0.1 / max_grad.max(1.0e-6)
-        };
-        for v in q.iter_mut() {
-            *v *= gamma;
-        }
-        for i in 0..m {
-            let beta = rho_hist[i] * dot(&y_hist[i], &q);
-            axpy(&mut q, alpha[i] - beta, &s_hist[i]);
-        }
-        let mut d: Vec<f64> = q.iter().map(|v| -v).collect();
-        // Guard against uphill directions.
-        if dot(&d, &g) > 0.0 {
-            d = g.iter().map(|v| -v).collect();
-        }
+        let d = memory.direction(&g, max_grad);
 
         // Backtracking Armijo line search.
         let g_dot_d = dot(&g, &d);
@@ -153,19 +201,10 @@ pub fn optimize(
         let g_new = flatten_grad(&grad_new.gradient);
 
         // Update L-BFGS memory.
-        let s: Vec<f64> = (0..ndof).map(|i| x_new[i] - x[i]).collect();
-        let y: Vec<f64> = (0..ndof).map(|i| g_new[i] - g[i]).collect();
-        let sy = dot(&s, &y);
-        if sy > 1.0e-10 {
-            s_hist.push(s);
-            y_hist.push(y);
-            rho_hist.push(1.0 / sy);
-            if s_hist.len() > opt.history {
-                s_hist.remove(0);
-                y_hist.remove(0);
-                rho_hist.remove(0);
-            }
-        }
+        memory.push(
+            (0..ndof).map(|i| x_new[i] - x[i]).collect(),
+            (0..ndof).map(|i| g_new[i] - g[i]).collect(),
+        );
 
         x = x_new;
         g = g_new;
@@ -192,7 +231,7 @@ pub fn optimize(
     })
 }
 
-fn flatten(mol: &Molecule) -> Vec<f64> {
+pub(crate) fn flatten(mol: &Molecule) -> Vec<f64> {
     let mut v = Vec::with_capacity(3 * mol.atoms.len());
     for a in &mol.atoms {
         v.push(a.position.x);
@@ -201,7 +240,7 @@ fn flatten(mol: &Molecule) -> Vec<f64> {
     }
     v
 }
-fn flatten_grad(g: &[Vec3]) -> Vec<f64> {
+pub(crate) fn flatten_grad(g: &[Vec3]) -> Vec<f64> {
     let mut v = Vec::with_capacity(3 * g.len());
     for gi in g {
         v.push(gi.x);
@@ -210,18 +249,18 @@ fn flatten_grad(g: &[Vec3]) -> Vec<f64> {
     }
     v
 }
-fn unflatten(x: &[f64]) -> Vec<Vec3> {
+pub(crate) fn unflatten(x: &[f64]) -> Vec<Vec3> {
     x.chunks(3).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
 }
-fn set_positions(mol: &mut Molecule, x: &[f64]) {
+pub(crate) fn set_positions(mol: &mut Molecule, x: &[f64]) {
     for (i, a) in mol.atoms.iter_mut().enumerate() {
         a.position = Vec3::new(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
     }
 }
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
-fn axpy(y: &mut [f64], a: f64, x: &[f64]) {
+pub(crate) fn axpy(y: &mut [f64], a: f64, x: &[f64]) {
     for (yi, xi) in y.iter_mut().zip(x) {
         *yi += a * xi;
     }

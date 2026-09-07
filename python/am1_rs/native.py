@@ -253,6 +253,9 @@ def divide_conquer(
     pbc=None,
     realspace_cutoff: float = 40.0,
     exchange_cutoff: float = 20.0,
+    optimize: bool = False,
+    opt_max_iter: int = 200,
+    opt_gtol: float = 1.0e-3,
 ) -> dict:
     """Divide-and-conquer SCF for large systems. Returns eV / Å.
 
@@ -285,6 +288,15 @@ def divide_conquer(
         scaling survives.
     forces : bool
         Whether to compute the gradient as well.
+    optimize : bool
+        Relax the geometry first, with divide-and-conquer supplying every energy and gradient,
+        and report the result at the relaxed geometry. ``positions_angstrom`` then holds where it
+        ended and ``opt_converged``/``opt_iterations``/``max_force_ev_per_bohr`` describe the
+        relaxation. A flag rather than a separate ``dc_optimize`` function — unlike the periodic
+        pair, where the relaxation takes cell and pressure arguments a single point has no use
+        for and returns a stress a single point does not have.
+    opt_max_iter, opt_gtol : int, float
+        Relaxation step limit, and convergence on the largest gradient component in eV/Bohr.
     multipole_cutoff : float or None
         Separation in **Bohr** beyond which a pair's electrostatics is treated as an atomic
         monopole instead of the full multipole block. ``None`` (default) keeps every pair exact,
@@ -356,6 +368,9 @@ def divide_conquer(
         pbc,
         float(realspace_cutoff),
         float(exchange_cutoff),
+        bool(optimize),
+        int(opt_max_iter),
+        float(opt_gtol),
     )
 
 
@@ -375,6 +390,7 @@ def phonons(
     p_tol: float = 1.0e-9,
     max_scf: int = 500,
     enforce_acoustic_sum_rule: bool = True,
+    eigenvectors: bool = False,
 ) -> dict:
     """Phonon frequencies of a periodic system, via supercell force constants.
 
@@ -401,6 +417,10 @@ def phonons(
         This is a correction, not a refinement — it moves the truncation error into the on-site
         term rather than removing it. ``acoustic_sum_rule_error_before`` is the honest measure of
         how much was wrong.
+    eigenvectors : bool
+        Also return the mode vectors. Off by default because they are ``n_q · (3N)²`` complex
+        numbers — a band structure over a few hundred q is a large array, and most callers only
+        want the frequencies.
 
     Returns
     -------
@@ -411,6 +431,25 @@ def phonons(
         ``commensurate_q`` — the q this supercell is exact at;
         ``acoustic_sum_rule_error_before``, ``acoustic_sum_rule_error`` — eV/Bohr²;
         ``supercell``, ``method``.
+
+    With ``eigenvectors=True``, four more keys, each ``[n_q][3N][3N]`` real nested lists — the
+    real and imaginary halves of two *different* conventions:
+
+    ``polarization_re`` / ``polarization_im``
+        the eigenvectors ``e(q)`` of the mass-weighted dynamical matrix, orthonormal. This is
+        what anything that sums over modes wants — mode occupations, Debye–Waller factors,
+        infrared and Raman intensities.
+    ``displacements_re`` / ``displacements_im``
+        ``e_a / √m_a``, what the atoms actually do, and what to add to a geometry to follow a
+        mode. Deliberately *not* renormalized, so the relative amplitude between a heavy and a
+        light atom is right; scale it yourself.
+
+    **Columns are modes** in both, matching ``frequencies_cm``: mode ``k`` at q index ``iq`` is
+    ``[iq][:][k]``, and its three components per atom run x, y, z. Complex because away from Γ
+    the pattern carries a Bloch phase from cell to cell — the imaginary part is that phase, not
+    numerical noise. To recombine::
+
+        e = np.asarray(r["polarization_re"]) + 1j * np.asarray(r["polarization_im"])
 
     Notes
     -----
@@ -447,6 +486,7 @@ def phonons(
         float(p_tol),
         int(max_scf),
         bool(enforce_acoustic_sum_rule),
+        bool(eigenvectors),
     )
 
 
@@ -498,7 +538,7 @@ def orbitals(numbers: Sequence[int], positions, charge: float = 0.0, multiplicit
     )
 
 
-def molden(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None) -> str:
+def molden(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, basis: str = "gto", primitives: int = 6, deorthogonalize: bool = True) -> str:
     """The wavefunction as a **Molden**-format string.
 
     Coordinates in **Ångström**; see :func:`single_point` for the keyword arguments. Write the
@@ -512,22 +552,108 @@ def molden(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity:
     is ``cp932`` on a Japanese Windows and ASCII under a ``C`` locale, so a file written without
     it is not portable between machines.
 
+    Parameters
+    ----------
+    basis : {"gto", "sto"}
+        Which basis section to write. ``"gto"`` (the default) writes a fitted Gaussian expansion
+        of the Slater shells; ``"sto"`` writes the Slater functions themselves.
+    primitives : int
+        Gaussians per shell for ``basis="gto"`` (1–10, default 6).
+    deorthogonalize : bool
+        Write ``S^{-1/2} C`` rather than the raw NDDO coefficients. Default ``True``.
+
     Notes
     -----
-    The AM1 valence basis is genuinely Slater-type, so the ``[STO]`` section describes it exactly
-    and no Gaussian expansion is invented. But NDDO **assumes** an orthonormal AO basis — its
-    working equations have no overlap matrix — so the ``[MO]`` coefficients are in an implicitly
-    orthogonalized basis while the ``[STO]`` functions are the raw, non-orthogonal ones. Orbital
-    shapes, nodes and symmetry are faithful; amplitudes in the bonding region are approximate.
-    The same caveat is written into the file itself.
+    The AM1 valence basis is genuinely Slater-type, so ``[STO]`` describes it exactly. It is
+    nevertheless **not** the default, because almost no viewer reads that section — Jmol, VMD,
+    Avogadro and Multiwfn all implement ``[GTO]`` and skip ``[STO]``, and a file whose basis
+    section is skipped draws orbitals from nothing. The default is a least-squares Gaussian
+    expansion fitted at run time, whose overlap with the Slater function it replaces is written
+    into the file's header (better than 0.99999 for every shell in the parameter sets).
+
+    NDDO **assumes** an orthonormal AO basis — its working equations have no overlap matrix — so
+    its coefficients are in an implicitly orthogonalized (Löwdin) basis while the functions the
+    file lists are the raw, non-orthogonal ones. Since 0.2.3 the two are reconciled rather than
+    apologized for: ``deorthogonalize`` transforms the coefficients by ``S^{-1/2}`` so they
+    belong to the basis the file declares. Pass ``deorthogonalize=False`` for the 0.2.2
+    behaviour, which is what most other NDDO codes emit.
     """
     n, p = _as_lists(numbers, positions)
     return _native.molden(
-        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field)
+        n,
+        p,
+        float(charge),
+        int(multiplicity),
+        reference,
+        method,
+        _field(electric_field),
+        str(basis),
+        int(primitives),
+        bool(deorthogonalize),
     )
 
 
-def ir_spectrum(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None) -> dict:
+def pbc_optimize(numbers: Sequence[int], positions, cell, pbc, kpts=(1, 1, 1), charge: float = 0.0, multiplicity: int = 1, unrestricted: bool = False, method: str = "am1", smearing_ev: float = 0.0, realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-8, p_tol: float = 1.0e-7, max_scf: int = 300, relax_cell: bool = False, pressure: float = 0.0, max_iter: int = 200, gtol: float = 1.0e-3, stress_tol: float = 1.0e-5, electric_field=None) -> dict:
+    """**L-BFGS geometry optimization under periodic boundary conditions.**
+
+    The periodic counterpart of :func:`optimize`. Relaxes the atoms against the k-point forces
+    and, with ``relax_cell``, the lattice against the analytic stress. Coordinates and cell
+    vectors in **Ångström**, energies in eV, forces in eV/Å.
+
+    ``pressure`` is a target in eV per Bohr^d (``d`` = number of periodic directions): the
+    enthalpy ``E + PΩ`` is what gets minimized. It does nothing without ``relax_cell``.
+
+    Returns
+    -------
+    dict with keys:
+        ``positions_angstrom`` (list[[float, float, float]]) and ``cell_angstrom`` (three lattice
+        vectors) — the relaxed structure. **Both** are needed with ``relax_cell``: the positions
+        alone do not describe it;
+        ``pbc`` (list[bool]), ``energy_ev``, ``energy_hartree``, ``free_energy_ev``,
+        ``electronic_ev``, ``core_ev`` (float);
+        ``forces_ev_per_angstrom`` (list[[float, float, float]]), ``stress_voigt`` (6 floats),
+        ``pressure``, ``max_force_ev_per_bohr`` (float);
+        ``charges`` (list[float]), ``fermi_energy_ev``, ``entropy_ev`` (float);
+        ``converged`` (bool), ``iterations`` (optimizer steps), ``scf_iterations``,
+        ``k_points`` (int), ``unrestricted`` (bool), ``max_image_overlap`` (float),
+        ``charged_cell_warning`` (str or None), ``method`` (str).
+
+    Notes
+    -----
+    A strain component is a variable only when both its axes are periodic, so a slab's vacuum
+    direction and a chain's two transverse directions are frozen by construction rather than by
+    an option. Convergence is on the physical quantities — the largest Cartesian force against
+    ``gtol`` and, with ``relax_cell``, the largest free component of ``σ + P I`` against
+    ``stress_tol``.
+    """
+    n, p = _as_lists(numbers, positions)
+    cell, pbc = _cell_and_pbc(cell, pbc)
+    return _native.pbc_optimize(
+        n,
+        p,
+        cell,
+        pbc,
+        tuple(int(k) for k in kpts),
+        float(charge),
+        int(multiplicity),
+        bool(unrestricted),
+        method,
+        float(smearing_ev),
+        float(realspace_cutoff),
+        float(exchange_cutoff),
+        float(e_tol),
+        float(p_tol),
+        int(max_scf),
+        bool(relax_cell),
+        float(pressure),
+        int(max_iter),
+        float(gtol),
+        float(stress_tol),
+        _field(electric_field),
+    )
+
+
+def ir_spectrum(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, cphf_max_iter: int | None = None, cphf_tol: float | None = None) -> dict:
     """Infrared spectrum: the atomic polar tensor and the mode-resolved intensities.
 
     **Expensive** — this solves the CPHF equations, i.e. it costs an analytic Hessian. It is a
@@ -560,11 +686,13 @@ def ir_spectrum(numbers: Sequence[int], positions, charge: float = 0.0, multipli
     """
     n, p = _as_lists(numbers, positions)
     return _native.ir_spectrum(
-        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field)
+        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field),
+        None if cphf_max_iter is None else int(cphf_max_iter),
+        None if cphf_tol is None else float(cphf_tol),
     )
 
 
-def vibrations(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, hessian: bool = True, frequencies: bool = True, ir: bool = True, orbital_response: bool = False, response_density: bool = False) -> dict:
+def vibrations(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, hessian: bool = True, frequencies: bool = True, ir: bool = True, orbital_response: bool = False, response_density: bool = False, cphf_max_iter: int | None = None, cphf_tol: float | None = None) -> dict:
     """The whole vibrational group from **one** SCF and one CPHF solve.
 
     :func:`hessian`, :func:`frequencies`, :func:`ir_spectrum`, :func:`dipole_derivatives` and
@@ -614,6 +742,8 @@ def vibrations(numbers: Sequence[int], positions, charge: float = 0.0, multiplic
         bool(ir),
         bool(orbital_response),
         bool(response_density),
+        None if cphf_max_iter is None else int(cphf_max_iter),
+        None if cphf_tol is None else float(cphf_tol),
     )
 
 
@@ -670,13 +800,19 @@ def orbital_response(numbers: Sequence[int], positions, charge: float = 0.0, mul
     )
 
 
-def hessian(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None) -> dict:
+def hessian(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, cphf_max_iter: int | None = None, cphf_tol: float | None = None) -> dict:
     """AM1 analytic (CPHF) Cartesian Hessian at the given geometry.
 
     The Hessian is the matrix of second derivatives ∂²E/∂R_i∂R_j. It is meaningful at any
     geometry; evaluate at a **stationary point** (optimize first) for a physical force-constant
     matrix. Coordinates in **Ångström**; see :func:`single_point` for ``charge``/``multiplicity``/``reference``.
 
+    cphf_max_iter, cphf_tol : int / float, optional
+        Iteration cap and residual threshold for the coupled-perturbed solve behind the Hessian.
+        ``None`` keeps the crate's defaults (100, 1e-9). These were private constants through
+        0.2.2: a system whose response needed more passes could not be given them from either API.
+        A response cannot be converged past the density it differentiates, so tightening
+        ``cphf_tol`` below the SCF's own accuracy asks for precision that is not there.
     Returns
     -------
     dict with keys:
@@ -689,7 +825,9 @@ def hessian(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity
     """
     n, p = _as_lists(numbers, positions)
     return _native.hessian(
-        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field)
+        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field),
+        None if cphf_max_iter is None else int(cphf_max_iter),
+        None if cphf_tol is None else float(cphf_tol),
     )
 
 
@@ -719,12 +857,18 @@ def am1_bcc(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity
     return _native.am1_bcc(n, p, float(charge), int(multiplicity))
 
 
-def frequencies(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None) -> dict:
+def frequencies(numbers: Sequence[int], positions, charge: float = 0.0, multiplicity: int = 1, reference: str = "auto", method: str = "am1", electric_field=None, cphf_max_iter: int | None = None, cphf_tol: float | None = None) -> dict:
     """Harmonic vibrational frequencies from the analytic (CPHF) Hessian.
 
     Evaluate at a **stationary point** (optimize first) for physically meaningful modes.
     Coordinates in **Ångström**; see :func:`single_point` for ``charge``/``multiplicity``/``reference``.
 
+    cphf_max_iter, cphf_tol : int / float, optional
+        Iteration cap and residual threshold for the coupled-perturbed solve behind the Hessian.
+        ``None`` keeps the crate's defaults (100, 1e-9). These were private constants through
+        0.2.2: a system whose response needed more passes could not be given them from either API.
+        A response cannot be converged past the density it differentiates, so tightening
+        ``cphf_tol`` below the SCF's own accuracy asks for precision that is not there.
     Returns
     -------
     dict with keys:
@@ -741,7 +885,9 @@ def frequencies(numbers: Sequence[int], positions, charge: float = 0.0, multipli
     """
     n, p = _as_lists(numbers, positions)
     return _native.frequencies(
-        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field)
+        n, p, float(charge), int(multiplicity), reference, method, _field(electric_field),
+        None if cphf_max_iter is None else int(cphf_max_iter),
+        None if cphf_tol is None else float(cphf_tol),
     )
 
 
@@ -754,12 +900,24 @@ def _cell_and_pbc(cell, pbc):
     return cell, pbc
 
 
-def pbc_hessian(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
+def pbc_hessian(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> dict:
     """Analytic force constants at ``q = 0`` with **k-point sampling** — the periodic Hessian.
 
     Unlike the Γ-only path this does not lean on the exchange taper: sampling ``k`` makes the
     real-space density matrix decay on its own, so the second derivatives are the ones the
     Hamiltonian implies rather than the ones the taper leaves behind. See ``docs/pbc.md``.
+
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
 
     Returns
     -------
@@ -770,16 +928,29 @@ def pbc_hessian(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), ch
     return _native.pbc_hessian(
         n, p, cell, pbc, tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
 
-def born_charges(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
+def born_charges(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> dict:
     """Born effective charges ``Z*_{a,αβ}``, in units of ``e``.
 
     ``Z*`` is how much dipole appears when an atom moves — the crystal's counterpart of
     :func:`dipole_derivatives`. It is well defined under periodic boundary conditions even though
     the absolute dipole is not, because charge is conserved and the origin dependence cancels
     term by term.
+
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
 
     Returns
     -------
@@ -793,15 +964,28 @@ def born_charges(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), c
     return _native.born_charges(
         n, p, cell, pbc, tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
 
-def polarizability(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
+def polarizability(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> dict:
     """Clamped-ion polarizability ``alpha`` (Bohr^3), in **any** periodic dimensionality.
 
     The same ``alpha`` :func:`dielectric` returns, without the ``eps_inf`` conversion -- which is
     why this one works for a chain and a slab and that one does not: ``eps_inf = 1 + 4*pi*alpha/V``
     needs ``V`` to be a volume.
+
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
 
     Returns
     -------
@@ -816,9 +1000,10 @@ def polarizability(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2),
     return _native.polarizability(
         n, p, cell, pbc, tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
-def dielectric_function(numbers: Sequence[int], positions, cell, pbc, q, chain_radius=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> float:
+def dielectric_function(numbers: Sequence[int], positions, cell, pbc, q, chain_radius=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> float:
     """Macroscopic longitudinal dielectric function ``eps(q)``, in any dimensionality.
 
     ``q`` is a Cartesian wavevector in **inverse Bohr** and must lie in the periodic subspace.
@@ -846,6 +1031,7 @@ def dielectric_function(numbers: Sequence[int], positions, cell, pbc, q, chain_r
         None if chain_radius is None else float(chain_radius),
         tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
 def polarization(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), strings: int = 8, charge: float = 0.0, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
@@ -910,13 +1096,25 @@ def finite_field(numbers: Sequence[int], positions, cell, pbc, field, kpts=(4, 4
     )
 
 
-def dielectric(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
+def dielectric(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> dict:
     """Clamped-ion polarizability ``α`` (Bohr³) and electronic dielectric tensor ``ε_∞``.
 
     **Three-dimensional cells only.** ``ε_∞ = 1 + 4πα/Ω`` needs ``Ω`` to be a volume; a chain has
     only a length and a slab only an area, and those are refused rather than silently divided by.
     Since 0.2.2 :func:`dielectric_with_extent` handles those, once the caller says how thick the
     material is — and it carries the depolarization factor the low-dimensional case needs.
+
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
 
     Returns
     -------
@@ -934,10 +1132,11 @@ def dielectric(numbers: Sequence[int], positions, cell, pbc, kpts=(2, 2, 2), cha
     return _native.dielectric(
         n, p, cell, pbc, tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
 
-def dielectric_with_extent(numbers: Sequence[int], positions, cell, pbc, slab_thickness=None, wire_cross_section=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500) -> dict:
+def dielectric_with_extent(numbers: Sequence[int], positions, cell, pbc, slab_thickness=None, wire_cross_section=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, allow_fractional_occupations: bool = False) -> dict:
     """``eps_infinity`` for a **slab or a chain**, given the extent you assign the material.
 
     Parameters
@@ -964,6 +1163,18 @@ def dielectric_with_extent(numbers: Sequence[int], positions, cell, pbc, slab_th
     boundary conditions remove the macroscopic depolarizing field, ``N`` is 0 everywhere, and this
     reduces to :func:`dielectric`'s ``1 + 4*pi*alpha/Omega``.
 
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
+
     Returns
     -------
     dict
@@ -989,10 +1200,11 @@ def dielectric_with_extent(numbers: Sequence[int], positions, cell, pbc, slab_th
         None if wire_cross_section is None else float(wire_cross_section),
         tuple(int(k) for k in kpts), float(charge), int(multiplicity), method,
         float(realspace_cutoff), float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
+        bool(allow_fractional_occupations),
     )
 
 
-def dfpt(numbers: Sequence[int], positions, cell, pbc, q_points, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, long_range: str = "auto", cpscf_tol: float = 1.0e-10, cpscf_max_iter: int = 200, cpscf_mixing: float = 0.7) -> dict:
+def dfpt(numbers: Sequence[int], positions, cell, pbc, q_points, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, long_range: str = "auto", cpscf_tol: float = 1.0e-8, cpscf_max_iter: int = 200, cpscf_mixing: float = 0.7, smearing_ev: float = 0.0, allow_fractional_occupations: bool = False) -> dict:
     """Phonons at **arbitrary** ``q`` by density-functional perturbation theory.
 
     No supercell. The response is solved on the primitive cell directly, with the perturbation
@@ -1020,6 +1232,18 @@ def dfpt(numbers: Sequence[int], positions, cell, pbc, q_points, kpts=(2, 2, 2),
         looks like ``worst residual=5e-9`` in the error. Loosen ``cpscf_tol`` to 1e-8, or raise
         ``cpscf_max_iter``, rather than reading the failure as a defect in the geometry.
 
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
+
     Returns
     -------
     dict with ``q_points``, ``frequencies_cm`` (one list of ``3·nat`` values per q) and ``method``.
@@ -1039,11 +1263,12 @@ def dfpt(numbers: Sequence[int], positions, cell, pbc, q_points, kpts=(2, 2, 2),
         n, p, cell, pbc, q_points, tuple(int(k) for k in kpts), float(charge),
         int(multiplicity), method, float(realspace_cutoff), float(exchange_cutoff),
         float(e_tol), float(p_tol), int(max_scf), long_range,
-        float(cpscf_tol), int(cpscf_max_iter), float(cpscf_mixing),
+        float(cpscf_tol), int(cpscf_max_iter), float(cpscf_mixing), float(smearing_ev),
+        bool(allow_fractional_occupations),
     )
 
 
-def lo_to_frequencies(numbers: Sequence[int], positions, cell, pbc, supercell=(2, 2, 2), direction=(1.0, 0.0, 0.0), q_points=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, enforce_acoustic_sum_rule: bool = True) -> dict:
+def lo_to_frequencies(numbers: Sequence[int], positions, cell, pbc, supercell=(2, 2, 2), direction=(1.0, 0.0, 0.0), q_points=None, kpts=(2, 2, 2), charge: float = 0.0, multiplicity: int = 1, method: str = "am1", realspace_cutoff: float = 40.0, exchange_cutoff: float = 20.0, e_tol: float = 1.0e-11, p_tol: float = 1.0e-10, max_scf: int = 500, enforce_acoustic_sum_rule: bool = True, eigenvectors: bool = False, allow_fractional_occupations: bool = False) -> dict:
     """Supercell phonons with the **LO–TO splitting** restored, from ``Z*`` and ``ε_∞``.
 
     **Three-dimensional cells only**: the non-analytic term ``4π(q·Z*)²/(Ω q·ε_∞·q)`` is the 3D
@@ -1059,6 +1284,18 @@ def lo_to_frequencies(numbers: Sequence[int], positions, cell, pbc, supercell=(2
     direction : tuple of three float
         The unit vector along which the ``q → 0`` limit is taken. It is required because the
         limit *is* direction dependent — that is what LO–TO splitting means.
+
+    allow_fractional_occupations : bool
+        Run anyway on a ground state whose levels are fractionally occupied, instead of raising.
+        Every response path here derives from a fixed integer occupation — there is no ``∂f/∂ε``
+        term anywhere in the coupled-perturbed equations — so a partially filled band is a term
+        the equations do not have rather than a small error in the answer. Through 0.2.2 both
+        paths ran regardless and both went wrong quietly, which is what the refusal replaces.
+
+        It does **not** gate smearing. The judgement is on the *converged occupations*, so a
+        gapped system smeared well below its gap is accepted: measured, cubic BN on a 4×4×4 mesh
+        at ``smearing_ev=0.3`` passes. Widening ``kT`` is the move that breaks it, and a finer
+        mesh is the one that does not.
 
     Returns
     -------
@@ -1081,4 +1318,5 @@ def lo_to_frequencies(numbers: Sequence[int], positions, cell, pbc, supercell=(2
         float(charge), int(multiplicity), method, float(realspace_cutoff),
         float(exchange_cutoff), float(e_tol), float(p_tol), int(max_scf),
         bool(enforce_acoustic_sum_rule),
+        bool(allow_fractional_occupations),
     )

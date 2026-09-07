@@ -161,13 +161,35 @@ fn the_atomic_polar_tensor_matches_a_dipole_finite_difference() {
 /// Obtained here by differencing the **analytic gradient** with respect to an applied field, so
 /// the reference runs through the field-perturbed SCF and the field's own CPHF contribution —
 /// a different half of the code from the nuclear response the analytic APT uses.
+///
+/// # The step is at the bottom of the U, and that is not a detail
+///
+/// A central difference carries two errors that move opposite ways: truncation, `O(h²·E''')`, and
+/// SCF noise, `O(residual/h)`. Sweeping `h` on this system separates them cleanly —
+///
+/// ```text
+/// h = 8.163e-4 : 3.91e-5      h = 2.721e-2 : 5.36e-6
+/// h = 2.721e-3 : 1.44e-5      h = 8.163e-2 : 4.70e-5
+/// h = 8.163e-3 : 5.72e-7   <- the minimum
+/// ```
+///
+/// — and the step this test used to take, `2.721e-3`, sat on the **noise-dominated** limb. That
+/// made the assertion a measurement of where the SCF happened to stop rather than of the
+/// interchange theorem: the convergence test admits `‖[F,P]‖ < 1e-7` as an alternative to `p_tol`,
+/// so two solver trajectories can both "converge" to points a good deal further apart than
+/// `p_tol`, and dividing that by a small `h` amplifies it. Changing the DIIS history window in
+/// 0.2.3 moved the number from `1e-6` to `1.4e-5` without changing any physics, which is how this
+/// was found.
+///
+/// At the minimum the two routes agree to **5.7e-7 e**, and the tolerance below is set from that
+/// rather than from whatever the previous step happened to give.
 #[test]
 fn the_atomic_polar_tensor_matches_the_mixed_field_nuclear_derivative() {
     let params = Am1Parameters::standard().unwrap();
     let mol = water();
     let apt = dipole_derivatives(&mol, &params, &tight(0.0, 1, None)).unwrap();
 
-    let h = 1.0e-4 * 27.21; // eV per (e·Bohr)
+    let h = 3.0e-4 * 27.21; // eV per (e·Bohr); see the note above on why this value
     let mut worst = 0.0_f64;
     for alpha in 0..3 {
         let unit = match alpha {
@@ -186,7 +208,7 @@ fn the_atomic_polar_tensor_matches_the_mixed_field_nuclear_derivative() {
     }
     eprintln!("    max |APT − (−∂²E/∂F∂R)| = {worst:.3e} e");
     assert!(
-        worst < 1.0e-5,
+        worst < 2.0e-6,
         "the two routes to the APT disagree by {worst:.3e} e"
     );
 }
@@ -223,15 +245,18 @@ fn water_has_three_infrared_active_vibrations() {
             "mode {k} has intensity {intensity:.3} km/mol, which is not an active band"
         );
     }
-    // And the rigid-body modes really were the other six.
-    assert_eq!(
+    // And the rigid-body modes really were the other six. Since 0.2.3 they are removed before
+    // the diagonalization rather than found afterwards, so the count comes from the rank of the
+    // rigid-body span and *no* mode carries rigid-body character any more.
+    assert_eq!(spectrum.modes.rigid_body_count, 6);
+    assert_eq!(spectrum.frequencies_cm.len(), 3);
+    assert!(
         spectrum
             .modes
             .translation_rotation_overlap
             .iter()
-            .filter(|o| **o > 0.5)
-            .count(),
-        6
+            .all(|o| *o < 1.0e-16),
+        "a mode still lies partly in the rigid-body subspace"
     );
 }
 
@@ -279,22 +304,20 @@ fn the_symmetric_stretch_of_carbon_dioxide_is_dark() {
     );
 }
 
-/// A linear molecule has five rigid-body modes, not six. The classification is by eigenvector
-/// overlap, so it discovers that rather than assuming `3N − 6`.
+/// A linear molecule has five rigid-body modes, not six. The count is the rank of the
+/// translation/rotation span, so it discovers that rather than assuming `3N − 6`.
 #[test]
 fn a_linear_molecule_has_five_rigid_body_modes() {
     let params = Am1Parameters::standard().unwrap();
     let spectrum = ir_spectrum(&co2(), &params, &tight(0.0, 1, None)).unwrap();
-    let rigid = spectrum
-        .modes
-        .translation_rotation_overlap
-        .iter()
-        .filter(|o| **o > 0.5)
-        .count();
+    let rigid = spectrum.modes.rigid_body_count;
     eprintln!(
         "    CO2: {rigid} rigid-body modes, {} vibrations",
-        spectrum.vibrational_bands(0.5).len()
+        spectrum.frequencies_cm.len()
     );
     assert_eq!(rigid, 5, "a linear triatomic has 3N−5 = 4 vibrations");
+    assert_eq!(spectrum.frequencies_cm.len(), 4);
+    assert_eq!(spectrum.intensities_km_per_mol.len(), 4);
+    // Every mode is a vibration now, so the filter returns all of them whatever the threshold.
     assert_eq!(spectrum.vibrational_bands(0.5).len(), 4);
 }

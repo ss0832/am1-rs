@@ -117,6 +117,48 @@ pub struct PbcOptions {
     /// dominant allocation of the run, the same way `dc:diis` is in divide-and-conquer. Lower it
     /// before lowering anything else if a run is tight on memory.
     pub diis_history: usize,
+    /// Run the multi-stage fallback when plain Pulay mixing is not converging. Default `true`.
+    ///
+    /// See [`ScfFallback`] for what the stages are, when each fires, and what the result carries
+    /// back about which of them ran. Setting this to `false` gives the fixed pipeline releases
+    /// through 0.2.2 had: superposition of atomic densities, then Pulay mixing, then the
+    /// iteration limit.
+    pub adaptive: bool,
+    /// Engage Kerker preconditioning from the first iteration, at this `κ` (eV⁻¹).
+    ///
+    /// `0.0`, the default, leaves it to [`Self::adaptive`] to switch on when the residual starts
+    /// growing. Set it explicitly for a system already known to slosh, to skip the iterations the
+    /// controller spends discovering that. See [`crate::pbc::kerker`] for what `κ` means and why
+    /// it is not the plane-wave `q₀`.
+    pub kerker_kappa: f64,
+    /// Iteration cap for the k-point CPHF behind a periodic analytic Hessian.
+    ///
+    /// Was a private constant through 0.2.2. Separate from [`Self::max_scf`] because the response
+    /// is a different fixed point from the ground state, and separate from
+    /// [`crate::pbc::dfpt::DfptOptions::cpscf_max_iter`] because the q = 0 Hessian and the
+    /// finite-q response are different solvers.
+    pub cphf_max_iter: usize,
+    /// Convergence threshold on the periodic CPHF residual, per perturbation.
+    pub cphf_tol: f64,
+    /// Refuse a **response** calculation whose converged ground state has fractional occupations.
+    /// Default `true`; new in 0.2.3.
+    ///
+    /// Every response path in this crate derives from a fixed integer occupation, so a partially
+    /// filled level is not a small error in the answer — it is a term the equations do not have.
+    /// The CPHF path silently drops such a level from both the occupied and the virtual set, and
+    /// DFPT freezes the occupation difference that weights each band pair. Through 0.2.2 both did
+    /// this without a word, which made a metal look like a supported case.
+    ///
+    /// This does **not** gate smearing, which is often the only way to converge the ground state
+    /// of a small-gap or coarsely sampled solid. The judgement is on the converged occupations, so
+    /// a gapped system smeared at a `kT` well below its gap passes: at `kT = 0.05 eV` a 3 eV gap
+    /// puts `exp(−30) ≈ 1e-13` in the conduction band. Widening `kT` is what breaks it, and a
+    /// finer mesh is the remedy that does not.
+    ///
+    /// Setting it to `false` restores the 0.2.2 behaviour — the calculation runs and the result is
+    /// wrong by the amount described above. There is no configurable tolerance because the cut is
+    /// not a matter of taste: see [`crate::pbc::INTEGER_OCCUPATION_TOL`].
+    pub require_integer_occupations: bool,
     /// Spin multiplicity `2S+1`. Anything above 1 selects the unrestricted path.
     pub multiplicity: usize,
     /// Force the unrestricted path even for a closed shell.
@@ -160,14 +202,6 @@ impl PbcOptions {
     }
 }
 
-/// The largest `Σ|c_i|` a DIIS step is allowed before it is thrown away.
-///
-/// Pulay coefficients sum to one but are otherwise unbounded, and a near-dependent history
-/// produces large cancelling entries — an extrapolation far outside the span the residuals
-/// actually resolve. The usual value; the point of having it is that the failure is a dropped
-/// step rather than a diverged run.
-const MAX_DIIS_WEIGHT: f64 = 40.0;
-
 /// Pulay (DIIS) coefficients for a set of flattened fixed-point residuals.
 ///
 /// Solves `min ‖Σ c_i r_i‖` subject to `Σ c_i = 1` through the bordered normal equations, and
@@ -182,8 +216,129 @@ const MAX_DIIS_WEIGHT: f64 = 40.0;
 ///
 /// Shared by the periodic SCF and the periodic CPSCF, which iterate different quantities to the
 /// same fixed-point form.
-pub(crate) fn pulay_coefficients(residuals: &[&[f64]]) -> Option<Vec<f64>> {
+pub fn pulay_coefficients(residuals: &[&[f64]]) -> Option<Vec<f64>> {
     let n = residuals.len();
+    if n < 2 {
+        return None;
+    }
+    let mut gram = vec![Vec::new(); n];
+    for i in 0..n {
+        gram[i] = (0..n)
+            .map(|j| {
+                if j > i {
+                    0.0
+                } else {
+                    residuals[i]
+                        .iter()
+                        .zip(residuals[j])
+                        .map(|(x, y)| x * y)
+                        .sum()
+                }
+            })
+            .collect();
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            gram[i][j] = gram[j][i];
+        }
+    }
+    pulay_from_gram(&gram)
+}
+
+/// Incrementally maintained Gram matrix for a Pulay history.
+///
+/// # Why this exists
+///
+/// [`pulay_coefficients`] rebuilds `⟨r_i, r_j⟩` for **every pair** on every call: `n(n+1)/2` dot
+/// products over vectors as long as the density. In the ground-state SCF that is once per
+/// iteration and lost in the noise. In the CPSCF it is once per iteration **per perturbation**,
+/// over the whole real-space response — and it measured as the largest single piece of the solve:
+/// `cpscf:mix` was 17 % of a DFPT phonon run on zincblende AlP, more than the two-electron kernel
+/// build it sits next to.
+///
+/// Almost all of that work is recomputed. Between one iteration and the next the history gains one
+/// residual and loses at most one, so exactly one row of the Gram matrix is new. Keeping it costs
+/// `depth²` floats — nothing beside the residuals themselves — and turns 55 dot products at depth
+/// ten into 10.
+pub struct PulayGram {
+    /// Lower-triangle-complete `⟨r_i, r_j⟩`, indexed as the caller's history is.
+    rows: Vec<Vec<f64>>,
+}
+
+impl Default for PulayGram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PulayGram {
+    pub fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    /// Forget the oldest entry, mirroring a `history.remove(0)` on the caller's side.
+    pub fn drop_oldest(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.rows.remove(0);
+        for row in &mut self.rows {
+            row.remove(0);
+        }
+    }
+
+    /// Coefficients for a history whose **last** entry is the one just added.
+    ///
+    /// Only that entry's row is computed; the rest is carried over. The caller is responsible for
+    /// having called [`Self::drop_oldest`] whenever it trimmed the history, and a mismatch is
+    /// caught rather than silently producing a Gram matrix of the wrong shape.
+    pub fn push_and_solve(&mut self, history: &[&[f64]]) -> Option<Vec<f64>> {
+        let n = history.len();
+        if n == 0 {
+            return None;
+        }
+        if self.rows.len() + 1 != n {
+            // The caller and this got out of step. Rebuilding is correct and cheap next to being
+            // wrong, and it means a future change to the history bookkeeping degrades to the old
+            // cost rather than to a bad answer.
+            self.rows.clear();
+            for i in 0..n - 1 {
+                self.rows.push(
+                    (0..=i)
+                        .map(|j| dot_slices(history[i], history[j]))
+                        .collect(),
+                );
+            }
+            for i in 0..n - 1 {
+                for j in (i + 1)..n - 1 {
+                    let v = self.rows[j][i];
+                    self.rows[i].push(v);
+                }
+            }
+        }
+        let last = history[n - 1];
+        let row: Vec<f64> = history.iter().map(|h| dot_slices(h, last)).collect();
+        for (i, existing) in self.rows.iter_mut().enumerate() {
+            existing.push(row[i]);
+        }
+        self.rows.push(row);
+        if n < 2 {
+            return None;
+        }
+        pulay_from_gram(&self.rows)
+    }
+}
+
+fn dot_slices(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// The Pulay solve, given `⟨r_i, r_j⟩` already formed.
+///
+/// Split out so the incremental and the from-scratch paths share the scaling, the ridge and the
+/// bordered solve rather than each carrying a copy of them.
+fn pulay_from_gram(gram: &[Vec<f64>]) -> Option<Vec<f64>> {
+    let n = gram.len();
     if n < 2 {
         return None;
     }
@@ -191,14 +346,9 @@ pub(crate) fn pulay_coefficients(residuals: &[&[f64]]) -> Option<Vec<f64>> {
     let mut b = Matrix::zeros(dim, dim);
     let mut scale = 0.0_f64;
     for i in 0..n {
-        for j in 0..=i {
-            let v: f64 = residuals[i]
-                .iter()
-                .zip(residuals[j])
-                .map(|(x, y)| x * y)
-                .sum();
+        for j in 0..n {
+            let v = gram[i][j];
             b[(i, j)] = v;
-            b[(j, i)] = v;
             scale = scale.max(v.abs());
         }
         b[(i, n)] = -1.0;
@@ -239,6 +389,12 @@ impl Default for PbcOptions {
             p_tol: 1.0e-7,
             mixing: 0.3,
             diis_history: 8,
+            adaptive: true,
+            kerker_kappa: 0.0,
+            // The values these were as private constants in pbc::hessian.
+            cphf_max_iter: 200,
+            cphf_tol: 1.0e-8,
+            require_integer_occupations: true,
             multiplicity: 1,
             unrestricted: false,
             electric_field: None,
@@ -333,7 +489,66 @@ impl RealSpaceBlocks {
         }
     }
 
+    /// [`Self::bloch_sum`] at **every** k point of a mesh, in one pass over the blocks.
+    ///
+    /// # Why this exists as a batch
+    ///
+    /// `bloch_sum` is `n_T · nao²` multiply-adds, and the SCF calls it once per k point per
+    /// iteration — so the same `n_T · nao²` array of force constants is streamed `n_k` times an
+    /// iteration, in a scalar loop through 2D indexing. On rutile GeO₂ with a 3×3×4 mesh that was
+    /// **41 % of the whole calculation**, more than the eigendecompositions it feeds (16 %),
+    /// which is not where the work in a periodic SCF belongs.
+    ///
+    /// Written across the whole mesh it is a matrix product. Pack the blocks as one `n_T × nao²`
+    /// panel `B` and the phases as `n_k × n_T` matrices `C = cos(k·T)` and `S = sin(k·T)`; then
+    /// every Bloch sum on the mesh is two GEMMs, `Re = C B` and `Im = S B`. Same arithmetic, but
+    /// the panel is traversed **once** instead of `n_k` times and the inner loop is the blocked
+    /// kernel rather than a scalar nest — the same rewrite, for the same reason, as
+    /// `pbc::hessian::project_ov` and the density build below.
+    ///
+    /// The `n_T × nao²` panel is a copy of data the caller already holds, so peak memory doubles
+    /// for the duration. That is bounded the same way the blocks are: `n_T` falls as the cell
+    /// grows (fewer images fit inside the real-space cutoff) exactly as `nao²` rises, so the
+    /// product grows linearly with system size, not quadratically.
+    pub fn bloch_sum_all(&self, kpoints: &[KPoint]) -> Vec<CMatrix> {
+        let nao = self.blocks.first().map(|m| m.rows).unwrap_or(0);
+        let (n_t, n_k, width) = (self.blocks.len(), kpoints.len(), nao * nao);
+        if n_k == 0 || n_t == 0 || nao == 0 {
+            return (0..n_k).map(|_| CMatrix::zeros(nao)).collect();
+        }
+        let mut panel = Matrix::zeros(n_t, width);
+        for (t, block) in self.blocks.iter().enumerate() {
+            panel.as_mut_slice()[t * width..(t + 1) * width].copy_from_slice(block.as_slice());
+        }
+        let (mut cos, mut sin) = (Matrix::zeros(n_k, n_t), Matrix::zeros(n_k, n_t));
+        for (ki, kp) in kpoints.iter().enumerate() {
+            for (ti, t) in self.translations.iter().enumerate() {
+                let (c, s) = kp.phase(*t);
+                cos[(ki, ti)] = c;
+                sin[(ki, ti)] = s;
+            }
+        }
+        let re = cos.matmul(&panel);
+        let im = sin.matmul(&panel);
+        (0..n_k)
+            .map(|ki| {
+                let mut out = CMatrix::zeros(nao);
+                out.re
+                    .as_mut_slice()
+                    .copy_from_slice(&re.as_slice()[ki * width..(ki + 1) * width]);
+                out.im
+                    .as_mut_slice()
+                    .copy_from_slice(&im.as_slice()[ki * width..(ki + 1) * width]);
+                out.hermitianize();
+                out
+            })
+            .collect()
+    }
+
     /// `M(k) = Σ_T e^{ik·T} M(0,T)`.
+    ///
+    /// For a whole mesh use [`Self::bloch_sum_all`], which does the same arithmetic as two matrix
+    /// products over one pass of the blocks instead of `n_k` scalar passes.
     pub fn bloch_sum(&self, k: &KPoint) -> CMatrix {
         let nao = self.blocks.first().map(|m| m.rows).unwrap_or(0);
         let mut out = CMatrix::zeros(nao);
@@ -398,7 +613,71 @@ pub struct PbcResult {
     pub max_image_overlap: f64,
     /// Set when the cell carries a net charge. See [`PbcResult::charged_cell_warning`].
     pub charged_cell_warning: Option<String>,
+    /// What the adaptive fallback did, if anything. See [`ScfFallback`].
+    pub fallback: ScfFallback,
 }
+
+/// What the adaptive SCF fallback did, carried on the result so a number knows its provenance.
+///
+/// # The pipeline
+///
+/// A single mixing scheme cannot converge every system, and the failure modes are distinguishable
+/// from the residual trace alone, so the controller watches it and switches:
+///
+/// ```text
+/// superposition of atomic densities
+///   └─ Pulay/DIIS on the real-space blocks, linear mixing 0.3
+///        ├─ residual falling steadily .......... converged
+///        ├─ residual growing or oscillating .... Kerker preconditioning, mixing → 0.1,
+///        │                                       DIIS history discarded
+///        └─ residual decaying at ratio > 0.99 .. raise the electronic temperature,
+///                                                then anneal it back down
+/// ```
+///
+/// # Why the annealing matters
+///
+/// Raising the smearing changes the *fixed point*, not just the path to it: the converged energy
+/// of a system at 0.5 eV is not its energy at 0.05 eV. So the temperature is walked back to the
+/// requested one, and convergence is not accepted until it is there — a run that reports
+/// `converged` has converged at the smearing the caller asked for. [`Self::max_smearing_ev`]
+/// records how far up it had to go, which is worth reading: a system that needed 1 eV to move at
+/// all is telling you something about its Fermi surface.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScfFallback {
+    /// `κ` of the Kerker preconditioner if it was engaged, `0.0` if it never was.
+    pub kerker_kappa: f64,
+    /// The linear-mixing fraction in force when the loop ended.
+    pub final_mixing: f64,
+    /// The highest electronic temperature (eV) used at any point, `≥ options.smearing_ev`.
+    pub max_smearing_ev: f64,
+    /// How many times the DIIS history was discarded — by the weight guard or by the controller.
+    pub diis_resets: usize,
+}
+
+/// Starting `κ` when the controller engages Kerker on its own, eV⁻¹.
+///
+/// Chosen so that a mode with the largest Coulomb eigenvalue a small cell produces — `γ` runs to
+/// a few tens of eV, since the on-site `G_ss` alone is 10–15 eV — is damped by roughly a factor
+/// of five, while a mode with `γ ≈ 1 eV` passes at 0.8. It is a starting point, not a tuned
+/// constant: the controller raises it if the residual is still growing after it engages.
+const KERKER_KAPPA_START: f64 = 0.2;
+
+/// Iterations the controller waits after a switch before judging again.
+///
+/// Long enough for the DIIS history to refill to a useful depth -- every switch discards it --
+/// and for the new configuration's decay rate to be measurable rather than transient.
+const COOLDOWN: usize = 20;
+
+/// How far the controller will raise the electronic temperature, eV, and how many times.
+///
+/// Capped because a raise is only worth making if it is annealed away again, and the walk back
+/// down costs iterations in proportion to how far up it went. Beyond a few tenths of an eV a
+/// system that still will not move is not going to be rescued by more.
+const MAX_SMEARING_EV: f64 = 1.0;
+const MAX_SMEARING_RAISES: usize = 3;
+
+/// Iterations to stay at a raised temperature before annealing regardless of progress.
+const ANNEAL_PATIENCE: usize = 40;
 
 /// The warning attached to any periodic result with a net charge.
 ///
@@ -813,28 +1092,58 @@ pub(crate) fn build_realspace_fock(
         let (na, nb) = (te.norb_i, te.norb_j);
 
         // Coulomb: on-site blocks, from the partner's on-site density. Lands on T = 0.
+        //
+        // # In the packed pair basis, both directions at once
+        //
+        // `(μν|λσ)` depends on `(μ,ν)` and `(λ,σ)` only through their packed indices — that is how
+        // `w` is stored — so a `4×4×4×4` nest visits each stored integral 2.56 times over and
+        // recomputes `pack` for every visit. Folding each on-site density onto the same packed
+        // index first (`pd[p] = Σ_{pack(λ,σ)=p} P_{λσ}`, exact: the two off-diagonal orderings are
+        // summed rather than assumed equal) turns the whole thing into one pass over `w`:
+        //
+        // ```text
+        // ja[p] = Σ_q w[p][q] pd_b[q]        the potential atom b exerts on atom a
+        // jb[q] = Σ_p pa_a[p] w[p][q]        and the one a exerts on b
+        // ```
+        //
+        // `10 × 10` multiply-adds on contiguous rows instead of `2 × 256` through a strided
+        // symmetric matrix, with the pair loop running to a 40 Bohr translation cutoff — this is
+        // the crate's innermost periodic loop. The molecular path has contracted this way since
+        // 0.1 (`fock::pair_contributions`); the periodic one was still the naive nest.
         {
+            let (nbra, nket) = (te.packed_bras(), te.packed_kets());
+            let mut pd_b = [0.0_f64; 10];
+            let mut pa_a = [0.0_f64; 10];
+            for la in 0..nb {
+                for si in 0..nb {
+                    pd_b[crate::integrals::PACK[la][si]] += p0[(ob + la, ob + si)];
+                }
+            }
+            for mu in 0..na {
+                for nu in 0..na {
+                    pa_a[crate::integrals::PACK[mu][nu]] += p0[(oa + mu, oa + nu)];
+                }
+            }
+            let mut ja = [0.0_f64; 10];
+            let mut jb = [0.0_f64; 10];
+            for p in 0..nbra {
+                let row = te.w_row(p);
+                let mut acc = 0.0;
+                for (q, w) in row.iter().enumerate().take(nket) {
+                    acc += w * pd_b[q];
+                    jb[q] += pa_a[p] * w;
+                }
+                ja[p] = acc;
+            }
             let origin = f.origin_mut()?;
             for mu in 0..na {
                 for nu in 0..na {
-                    let mut acc = 0.0;
-                    for la in 0..nb {
-                        for si in 0..nb {
-                            acc += p0[(ob + la, ob + si)] * te.two_e(mu, nu, la, si);
-                        }
-                    }
-                    origin[(oa + mu, oa + nu)] += acc;
+                    origin[(oa + mu, oa + nu)] += ja[crate::integrals::PACK[mu][nu]];
                 }
             }
             for la in 0..nb {
                 for si in 0..nb {
-                    let mut acc = 0.0;
-                    for mu in 0..na {
-                        for nu in 0..na {
-                            acc += p0[(oa + mu, oa + nu)] * te.two_e(mu, nu, la, si);
-                        }
-                    }
-                    origin[(ob + la, ob + si)] += acc;
+                    origin[(ob + la, ob + si)] += jb[crate::integrals::PACK[la][si]];
                 }
             }
         }
@@ -848,16 +1157,24 @@ pub(crate) fn build_realspace_fock(
             Some(m) => m,
             None => continue,
         };
+        // `K(μ_a, λ_b) = Σ_{ν,σ} P(0,T)_{ν_a σ_b} (μν|λσ)`. The bra row is hoisted out of the
+        // `(λ, σ)` loop — sixteen row lookups per pair instead of two hundred and fifty-six.
+        // `P(0,T)` couples two different atoms, so unlike the Coulomb term above it has no
+        // symmetry to fold and stays a `4×4` contraction.
         let mut k_block = vec![0.0; na * nb];
+        let weight = -spin_scale * pair.exchange_scale;
         for mu in 0..na {
-            for la in 0..nb {
-                let mut acc = 0.0;
-                for nu in 0..na {
-                    for si in 0..nb {
-                        acc += spin_scale * pt[(oa + nu, ob + si)] * te.two_e(mu, nu, la, si);
+            for nu in 0..na {
+                let row = te.two_e_row(mu, nu);
+                for si in 0..nb {
+                    let p = pt[(oa + nu, ob + si)];
+                    if p == 0.0 {
+                        continue;
+                    }
+                    for la in 0..nb {
+                        k_block[mu * nb + la] += weight * p * row[crate::integrals::PACK[la][si]];
                     }
                 }
-                k_block[mu * nb + la] = -acc * pair.exchange_scale;
             }
         }
         if let Some(block) = f.get_mut(pair.offset) {
@@ -921,27 +1238,33 @@ pub(crate) fn run_pbc_scf_with_k_terms(
     let neighbors = NeighborList::build(molecule, options.realspace_cutoff);
     // Long-range monopole correction, shared by every k point: it is a real-space, atom-pair
     // quantity with no Bloch phase, so one matrix serves the whole mesh.
-    let long_range = crate::pbc::ewald::LongRangeMonopole::for_molecule_with(
-        molecule,
-        options
-            .klopman_ohno_tail
-            .then_some((params, options.realspace_cutoff)),
-        &neighbors,
-        options.ewald,
-    )?;
+    let long_range = {
+        let _t = crate::timing::Timer::start("pbc:ewald");
+        crate::pbc::ewald::LongRangeMonopole::for_molecule_with(
+            molecule,
+            options
+                .klopman_ohno_tail
+                .then_some((params, options.realspace_cutoff)),
+            &neighbors,
+            options.ewald,
+        )?
+    };
     let delta = long_range.as_ref().map(|(m, _)| &m.delta);
     let translations = cell.image_offsets(options.realspace_cutoff);
     let k_points = options.resolve_kpoints(&cell)?;
 
-    let (core, pairs) = build_realspace_core(
-        molecule,
-        &basis,
-        params,
-        &neighbors,
-        &translations,
-        options.exchange_cutoff,
-        options.electric_field,
-    )?;
+    let (core, pairs) = {
+        let _t = crate::timing::Timer::start("pbc:core");
+        build_realspace_core(
+            molecule,
+            &basis,
+            params,
+            &neighbors,
+            &translations,
+            options.exchange_cutoff,
+            options.electric_field,
+        )?
+    };
 
     let mut n_elec = 0.0;
     for atom in &molecule.atoms {
@@ -1000,13 +1323,38 @@ pub(crate) fn run_pbc_scf_with_k_terms(
         channels.push(d);
     }
 
-    let filling = if options.smearing_ev > 0.0 {
-        Filling::Fermi {
-            kt: options.smearing_ev,
-        }
-    } else {
-        Filling::Aufbau
+    // The electronic temperature actually in force, which the controller may raise above the
+    // requested one and then walk back down. `filling` is derived from it each pass.
+    let mut smearing = options.smearing_ev;
+    let mut fallback = ScfFallback {
+        final_mixing: options.mixing,
+        max_smearing_ev: options.smearing_ev,
+        ..Default::default()
     };
+    let mut mixing = options.mixing;
+    // Kerker is built lazily: the `nat × nat` solve is cheap, but on a system that converges
+    // without help it is work for nothing, and most do.
+    let mut kerker: Option<crate::pbc::kerker::Kerker> = None;
+    if options.kerker_kappa > 0.0 {
+        kerker = Some(crate::pbc::kerker::Kerker::new(
+            molecule,
+            params,
+            &pairs.pairs,
+            delta,
+            options.kerker_kappa,
+        )?);
+        fallback.kerker_kappa = options.kerker_kappa;
+    }
+    let origin_index = translations
+        .iter()
+        .position(|t| t.is_origin())
+        .ok_or_else(|| Am1Error::InvalidInput("the translation set has no origin".into()))?;
+    // The residual trace the controller's judgments are read off, and its state.
+    let mut dp_trace: Vec<f64> = Vec::new();
+    let mut cooldown = 0usize;
+    let mut smearing_raises = 0usize;
+    let mut hot_for = 0usize;
+    let mut dp_at_raise = f64::INFINITY;
 
     let mut e_old = 0.0;
     let mut converged = false;
@@ -1035,6 +1383,12 @@ pub(crate) fn run_pbc_scf_with_k_terms(
 
     for iter in 0..options.max_scf {
         iterations = iter + 1;
+        // Derived here rather than hoisted: the controller can move smearing between passes.
+        let filling = if smearing > 0.0 {
+            Filling::Fermi { kt: smearing }
+        } else {
+            Filling::Aufbau
+        };
 
         // Total on-site density drives the Coulomb terms for every channel.
         let mut total_origin = Matrix::zeros(nao, nao);
@@ -1049,27 +1403,35 @@ pub(crate) fn run_pbc_scf_with_k_terms(
         let mut new_channels = Vec::with_capacity(channels.len());
         band_energy = 0.0;
         entropy = 0.0;
-        fermi_energy = 0.0;
+        fermi_energy = f64::NEG_INFINITY;
 
         for (ci, spin_density) in channels.iter().enumerate() {
             let spin_scale = if use_uhf { 1.0 } else { 0.5 };
-            let fock = build_realspace_fock(
-                &core,
-                &pairs,
-                &total_origin,
-                spin_density,
-                spin_scale,
-                &basis,
-                molecule,
-                params,
-                delta,
-            )?;
+            let fock = {
+                let _t = crate::timing::Timer::start("pbc:fock");
+                build_realspace_fock(
+                    &core,
+                    &pairs,
+                    &total_origin,
+                    spin_density,
+                    spin_scale,
+                    &basis,
+                    molecule,
+                    params,
+                    delta,
+                )?
+            };
 
             // Diagonalize at every k; one Fermi level across the whole zone for this channel.
             let mut eigen = Vec::with_capacity(k_points.len());
             let mut levels = Vec::with_capacity(k_points.len() * nao);
+            // The whole mesh at once — see `bloch_sum_all` for why this is not a loop.
+            let mut hks = {
+                let _t = crate::timing::Timer::start("pbc:bloch");
+                fock.bloch_sum_all(&k_points)
+            };
             for (kidx, kp) in k_points.iter().enumerate() {
-                let mut hk = fock.bloch_sum(kp);
+                let mut hk = std::mem::replace(&mut hks[kidx], CMatrix::zeros(0));
                 if let Some(extra) = k_terms {
                     let add = extra.get(kidx).ok_or_else(|| {
                         Am1Error::InvalidInput(
@@ -1085,7 +1447,10 @@ pub(crate) fn run_pbc_scf_with_k_terms(
                         }
                     }
                 }
-                let e = hermitian_eigen(&hk)?;
+                let e = {
+                    let _t = crate::timing::Timer::start("pbc:eigen");
+                    hermitian_eigen(&hk)?
+                };
                 for &value in &e.values {
                     levels.push(Level {
                         energy: value,
@@ -1095,15 +1460,29 @@ pub(crate) fn run_pbc_scf_with_k_terms(
                 eigen.push(e);
             }
 
-            let occ = fill(&levels, channel_electrons[ci], filling)?;
+            let occ = {
+                let _t = crate::timing::Timer::start("pbc:fill");
+                fill(&levels, channel_electrons[ci], filling)?
+            };
             band_energy += occ.band_energy;
             entropy += occ.ts;
             // An empty channel has no meaningful chemical potential, so it must not be allowed
             // to set the reported one. With a fixed multiplicity the two channels genuinely
             // have separate Fermi levels; what is reported is the highest among the channels
             // that actually hold electrons.
+            //
+            // The accumulator starts at `−∞`, not at zero. Folding `max` from zero silently
+            // clamps the reported chemical potential to zero for **every bound system** — a
+            // Fermi level is a few eV *below* vacuum, so `max(0, −8.5)` is 0 — and that is what
+            // 0.2.2 reported, through `PbcResult::fermi_energy_ev`, `native.pbc_point` and
+            // `Calculator.results["fermi_energy"]` alike. It did not show because the only test
+            // that looked at it used a half-filled band and printed rather than asserted.
             if channel_electrons[ci] > 1.0e-12 {
-                fermi_energy = fermi_energy.max(occ.fermi_energy);
+                fermi_energy = if fermi_energy.is_finite() {
+                    fermi_energy.max(occ.fermi_energy)
+                } else {
+                    occ.fermi_energy
+                };
             }
 
             let mut new_density = RealSpaceBlocks::zeros(&translations, nao);
@@ -1230,7 +1609,42 @@ pub(crate) fn run_pbc_scf_with_k_terms(
         if final_pass {
             break;
         }
-        if iter > 0 && de < options.e_tol && dp < options.p_tol {
+        // Only at the temperature that was asked for. A run held at a raised smearing is
+        // converged to a *different* fixed point, and reporting that as success would return the
+        // energy of a system at an electronic temperature the caller never chose.
+        let at_target_smearing = (smearing - options.smearing_ev).abs() < 1.0e-12;
+        let tolerances_met = iter > 0 && de < options.e_tol && dp < options.p_tol;
+        if tolerances_met && !at_target_smearing {
+            // Converged, but at a temperature the controller raised and the caller did not ask
+            // for. Drop straight to the requested one and carry on from the density just found:
+            // it is a far better starting guess for the cold problem than anything else
+            // available, and this is the whole point of having raised the temperature.
+            //
+            // Straight down rather than by halving. The gradual walk is for when the residual is
+            // still large and the fixed point has to be tracked; here it is `1e-10`, and a ladder
+            // of halvings towards a target of zero never arrives — measured, on this exact BN
+            // cell, sitting at 0.037 eV with `dP = 5e-11` and the loop reporting failure.
+            if trace {
+                eprintln!(
+                    "[am1 pbc scf] converged at kT {smearing:.3} eV; restarting at the requested \
+                     {:.3} eV",
+                    options.smearing_ev
+                );
+            }
+            smearing = options.smearing_ev;
+            for (ch, new_ch) in channels.iter_mut().zip(&new_channels) {
+                for (block, nb) in ch.blocks.iter_mut().zip(&new_ch.blocks) {
+                    block.as_mut_slice().copy_from_slice(nb.as_slice());
+                }
+            }
+            history.clear();
+            fallback.diis_resets += 1;
+            dp_trace.clear();
+            cooldown = COOLDOWN;
+            e_old = 0.0;
+            continue;
+        }
+        if tolerances_met {
             converged = true;
             // Take the **output** density and spend one more pass on it.
             //
@@ -1252,8 +1666,138 @@ pub(crate) fn run_pbc_scf_with_k_terms(
         }
         if trace {
             eprintln!(
-                "[am1 pbc scf] iter {iterations:4}  E {electronic:.12}  dE {de:.3e}  dP {dp:.3e}"
+                "[am1 pbc scf] iter {iterations:4}  E {electronic:.12}  dE {de:.3e}  dP {dp:.3e}  \
+                 mix {mixing:.2}  kT {smearing:.3}  kerker {:.2}  diis {}",
+                fallback.kerker_kappa,
+                history.len()
             );
+        }
+
+        // ---- the fallback controller: read the residual trace, decide whether to switch ----
+        //
+        // # Why every switch is followed by a cooldown
+        //
+        // Each of these actions discards the DIIS history — it has to, because the history
+        // describes a map that has just changed. But a detector that fires again immediately
+        // discards the history it just rebuilt, and the iteration is left running a bare linear
+        // mix forever. That is not hypothetical: the first version of this controller took a BN
+        // cell that was converging slowly and pinned it at a 1.5 %-per-iteration decay for 355
+        // passes, because the stall detector re-fired every twelve of them. The remedy for a
+        // stall is not applying the remedy more often.
+        dp_trace.push(dp);
+        if cooldown > 0 {
+            cooldown -= 1;
+        } else if options.adaptive && dp > options.p_tol {
+            // The `dp > p_tol` gate covers every judgment below. Under the tolerance the residual
+            // is floating-point noise, and `dp > 2 * best` is then satisfied by noise alone —
+            // which had the controller call a run that had reached `dP = 1e-10` diverging, and
+            // discard the history it had converged with.
+            let best = dp_trace.iter().copied().fold(f64::INFINITY, f64::min);
+            // **Judgment B — diverging or oscillating.** Not "it went up once": Pulay steps
+            // legitimately overshoot on the way down. A residual at twice its own best, eight
+            // passes in, is not on its way anywhere.
+            let diverging = dp_trace.len() >= 8 && dp > 2.0 * best;
+            // **Judgment C — stiff.** Falling, but by so little per pass that the iteration
+            // limit will arrive first. The geometric mean ratio over the last eight passes,
+            // which is insensitive to one flat step and to the period-4 oscillation a Pulay
+            // mixer superimposes on an otherwise healthy decay.
+            let stiff = dp_trace.len() >= 12 && {
+                let tail = &dp_trace[dp_trace.len() - 9..];
+                let ratio = (tail[8].max(1.0e-300) / tail[0].max(1.0e-300)).powf(0.125);
+                ratio > 0.99 && dp > options.p_tol
+            };
+            if diverging {
+                // Kerker first, and only then a tighter mix. Damping alone converges a sloshing
+                // system too, eventually — it damps every direction equally, so the well
+                // conditioned ones pay for the badly conditioned one, and "eventually" is the
+                // iteration limit. The preconditioner is what makes a usable mix affordable,
+                // which is why the mix only drops to 0.2 here and to 0.1 on a second failure.
+                let (kappa, next_mixing) = if fallback.kerker_kappa > 0.0 {
+                    (fallback.kerker_kappa * 2.0, 0.1)
+                } else {
+                    (KERKER_KAPPA_START, 0.2)
+                };
+                kerker = Some(crate::pbc::kerker::Kerker::new(
+                    molecule,
+                    params,
+                    &pairs.pairs,
+                    delta,
+                    kappa,
+                )?);
+                fallback.kerker_kappa = kappa;
+                mixing = mixing.min(next_mixing);
+                history.clear();
+                fallback.diis_resets += 1;
+                dp_trace.clear();
+                cooldown = COOLDOWN;
+                if trace {
+                    eprintln!(
+                        "[am1 pbc scf] diverging: Kerker kappa {kappa:.2} eV^-1, mixing {mixing:.2}"
+                    );
+                }
+            } else if stiff && smearing_raises < MAX_SMEARING_RAISES {
+                // Blur the Fermi surface. A stalled residual at a fixed occupation usually means
+                // two levels are trading places across the chemical potential every pass, which
+                // is a discontinuity in the map being iterated, not a slow contraction.
+                smearing = if smearing < 0.3 {
+                    0.3
+                } else {
+                    (smearing * 2.0).min(MAX_SMEARING_EV)
+                };
+                smearing_raises += 1;
+                dp_at_raise = dp;
+                hot_for = 0;
+                fallback.max_smearing_ev = fallback.max_smearing_ev.max(smearing);
+                history.clear();
+                fallback.diis_resets += 1;
+                dp_trace.clear();
+                cooldown = COOLDOWN;
+                if trace {
+                    eprintln!(
+                        "[am1 pbc scf] stiff: electronic temperature raised to {smearing:.2} eV"
+                    );
+                }
+            } else if smearing > options.smearing_ev {
+                // Anneal back once the raise has bought something — an order of magnitude off the
+                // residual it was raised at — or once it is clear it never will. The fixed point
+                // moves with the temperature, so the history goes with it.
+                hot_for += 1;
+                if dp < 0.05 * dp_at_raise || hot_for > ANNEAL_PATIENCE {
+                    smearing = (smearing * 0.5).max(options.smearing_ev);
+                    if smearing < options.smearing_ev + 1.0e-3 {
+                        smearing = options.smearing_ev;
+                    }
+                    dp_at_raise = dp;
+                    hot_for = 0;
+                    history.clear();
+                    fallback.diis_resets += 1;
+                    dp_trace.clear();
+                    cooldown = COOLDOWN;
+                    if trace {
+                        eprintln!(
+                            "[am1 pbc scf] annealing: electronic temperature down to {smearing:.3} eV"
+                        );
+                    }
+                }
+            }
+        }
+        fallback.final_mixing = mixing;
+
+        // Kerker preconditioning, on the residual the mixer steps along — never on `dp`, which
+        // has already been measured, and never on `new_channels`, which is what a converged run
+        // returns. Only the origin block carries atomic charge, so only it is touched.
+        if let Some(k) = kerker.as_ref() {
+            let width = nao * nao;
+            let n_blocks = translations.len();
+            let mut scratch = Matrix::zeros(nao, nao);
+            for ci in 0..channels.len() {
+                let start = ci * n_blocks * width + origin_index * width;
+                scratch
+                    .as_mut_slice()
+                    .copy_from_slice(&diis_resid[start..start + width]);
+                k.apply(&mut scratch, &basis);
+                diis_resid[start..start + width].copy_from_slice(scratch.as_slice());
+            }
         }
 
         // Pulay (DIIS) mixing on the real-space blocks, falling back to the linear mix. `dp` above
@@ -1266,23 +1810,35 @@ pub(crate) fn run_pbc_scf_with_k_terms(
             }
             history.push((diis_input.clone(), diis_resid.clone()));
             let residuals: Vec<&[f64]> = history.iter().map(|(_, r)| r.as_slice()).collect();
+            // # There is no bound on `Σ|c_i|` here, and there was
+            //
+            // Through 0.2.2 a step whose coefficients summed to more than 40 was thrown away and
+            // the whole history discarded. The reasoning — large cancelling coefficients mean an
+            // extrapolation outside the span the residuals resolve — is the usual one and is
+            // wrong for the case that matters. When the iteration is decaying geometrically
+            // along one dominant mode, consecutive residuals are nearly parallel, and the
+            // *correct* Pulay answer at depth two is `c = (−499, 500)` for a ratio of 0.998:
+            // Aitken extrapolation, the thing that turns a slow linear decay into convergence.
+            // Bounding it rejects exactly that step, every pass, and the history never survives
+            // to depth three.
+            //
+            // Measured, on zincblende BN at a 4×4×4 mesh: the history was cleared on **every
+            // iteration**, so the run was a bare 0.1 linear mix and did not converge in 400
+            // passes at any setting. Without the bound it converges in 119. Rutile GeO₂, which
+            // converged either way, went from 62 iterations to 38 — to the same energy, to all
+            // twelve digits. Nothing in the suite got slower.
+            //
+            // What still refuses a step is [`pulay_coefficients`] itself: the bordered solve has
+            // a pivot guard, and non-finite coefficients are rejected there. Those are about the
+            // solve being meaningless, which is a different thing from the answer being large.
             if let Some(c) = pulay_coefficients(&residuals) {
-                // A DIIS whose coefficients have blown up is extrapolating along a direction the
-                // history does not actually resolve. Dropping the step is cheaper than the
-                // divergence, and the history is cleared so the next one starts from a mix that
-                // is known to be a contraction.
-                let weight: f64 = c.iter().take(history.len()).map(|v| v.abs()).sum();
-                if weight <= MAX_DIIS_WEIGHT {
-                    let mut next = vec![0.0; diis_input.len()];
-                    for (ci, (p_in, r)) in c.iter().zip(&history) {
-                        for ((n, p), rv) in next.iter_mut().zip(p_in).zip(r) {
-                            *n += ci * (p + options.mixing * rv);
-                        }
+                let mut next = vec![0.0; diis_input.len()];
+                for (ci, (p_in, r)) in c.iter().zip(&history) {
+                    for ((n, p), rv) in next.iter_mut().zip(p_in).zip(r) {
+                        *n += ci * (p + mixing * rv);
                     }
-                    extrapolated = Some(next);
-                } else {
-                    history.clear();
                 }
+                extrapolated = Some(next);
             }
         }
 
@@ -1299,10 +1855,15 @@ pub(crate) fn run_pbc_scf_with_k_terms(
                 }
             }
             None => {
-                for (old_ch, new_ch) in channels.iter_mut().zip(&new_channels) {
-                    for (old, new) in old_ch.blocks.iter_mut().zip(&new_ch.blocks) {
-                        for (o, n) in old.as_mut_slice().iter_mut().zip(new.as_slice()) {
-                            *o += options.mixing * (*n - *o);
+                // `diis_resid`, not `new − old`: the preconditioner above rewrote the residual,
+                // and the linear fallback has to step along the same direction the Pulay branch
+                // would have. Recomputing the difference here would quietly ignore it.
+                let mut k = 0;
+                for ch in channels.iter_mut() {
+                    for block in ch.blocks.iter_mut() {
+                        for o in block.as_mut_slice().iter_mut() {
+                            *o += mixing * diis_resid[k];
+                            k += 1;
                         }
                     }
                 }
@@ -1368,13 +1929,21 @@ pub(crate) fn run_pbc_scf_with_k_terms(
         core_ev,
         total_ev: electronic + core_ev,
         band_energy_ev: band_energy,
-        fermi_energy_ev: fermi_energy,
+        // `−∞` is the "no channel held an electron" sentinel, which a caller should not have to
+        // know about; a system with no electrons has no chemical potential and zero is the
+        // conventional stand-in.
+        fermi_energy_ev: if fermi_energy.is_finite() {
+            fermi_energy
+        } else {
+            0.0
+        },
         entropy_ev: entropy,
         charges,
         k_points: k_points.len(),
         iterations,
         converged,
         max_image_overlap: pairs.max_image_overlap,
+        fallback,
         charged_cell_warning: charged_cell_warning(
             options.charge,
             cell.n_periodic(),
@@ -1417,6 +1986,7 @@ mod spin_channel_tests {
             converged: true,
             max_image_overlap: 0.0,
             charged_cell_warning: None,
+            fallback: ScfFallback::default(),
         }
     }
 

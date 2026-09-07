@@ -100,7 +100,8 @@ def pbc_hessian(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def born_charges(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -115,7 +116,8 @@ def born_charges(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def polarizability(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -130,7 +132,9 @@ def polarizability(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> dict[str, Any]: ...def dielectric_function(
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
+def dielectric_function(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
     cell: Sequence[Sequence[float]],
@@ -146,7 +150,9 @@ def polarizability(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> float: ...def polarization(
+
+    allow_fractional_occupations: bool = ...,) -> float: ...
+def polarization(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
     cell: Sequence[Sequence[float]],
@@ -178,7 +184,8 @@ def finite_field(
     max_outer: int = ...,
     outer_tol: float = ...,
     outer_mixing: float = ...,
-) -> dict[str, Any]: ...def dielectric(
+) -> dict[str, Any]: ...
+def dielectric(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
     cell: Sequence[Sequence[float]],
@@ -192,7 +199,8 @@ def finite_field(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def dielectric_with_extent(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -209,7 +217,8 @@ def dielectric_with_extent(
     e_tol: float = ...,
     p_tol: float = ...,
     max_scf: int = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def dfpt(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -229,7 +238,8 @@ def dfpt(
     cpscf_tol: float = ...,
     cpscf_max_iter: int = ...,
     cpscf_mixing: float = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def lo_to_frequencies(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -248,7 +258,8 @@ def lo_to_frequencies(
     p_tol: float = ...,
     max_scf: int = ...,
     enforce_acoustic_sum_rule: bool = ...,
-) -> dict[str, Any]: ...
+
+    allow_fractional_occupations: bool = ...,) -> dict[str, Any]: ...
 def phonons(
     numbers: Sequence[int],
     positions: Sequence[Sequence[float]],
@@ -265,6 +276,7 @@ def phonons(
     p_tol: float = ...,
     max_scf: int = ...,
     enforce_acoustic_sum_rule: bool = ...,
+    eigenvectors: bool = ...,
 ) -> dict[str, Any]: ...
 def constants() -> dict[str, float]: ...
 def pbc_point(

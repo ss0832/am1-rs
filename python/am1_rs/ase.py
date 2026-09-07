@@ -30,6 +30,23 @@ except ImportError as exc:  # pragma: no cover
 from . import native
 
 
+def _join_complex(result: dict, names) -> dict:
+    """Fold ``<name>_re`` / ``<name>_im`` pairs into one complex ndarray under ``<name>``.
+
+    The native layer returns the halves separately because it hands back plain nested lists and
+    has no complex type to put them in. Nothing above it wants two arrays, so this boundary —
+    where numpy is already a hard dependency — is where they get joined. Absent keys are skipped,
+    which is the case when the caller did not ask for eigenvectors.
+    """
+    for name in names:
+        re = result.pop(f"{name}_re", None)
+        im = result.pop(f"{name}_im", None)
+        if re is None or im is None:
+            continue
+        result[name] = np.asarray(re, dtype=float) + 1j * np.asarray(im, dtype=float)
+    return result
+
+
 class AM1(Calculator):
     """AM1/RM1 semiempirical calculator (ASE units: eV, eV/Å, Å, eV/Å³).
 
@@ -60,6 +77,22 @@ class AM1(Calculator):
         Periodic SCF controls. The defaults suit dynamics; tighten ``e_tol``/``p_tol`` before
         taking a finite difference of the energy, because the SCF's own convergence error does
         not cancel between two displaced geometries.
+    allow_fractional_occupations : bool
+        Run a periodic **response** — ``get_hessian`` under a cell, ``get_born_charges``,
+        ``get_dielectric_tensor``, ``get_polarizability``, ``get_dfpt_frequencies``,
+        ``get_lo_to_frequencies`` — on a ground state whose levels are fractionally occupied.
+        Default ``False``, which raises instead.
+
+        Every one of those derives from a fixed integer occupation: there is no ``∂f/∂ε`` term in
+        the coupled-perturbed equations, so the Fermi surface cannot respond to the perturbation.
+        A partially filled band is therefore a term the equations do not have, not a small error
+        in the answer, and through 0.2.2 both response paths ran regardless and were wrong without
+        saying so.
+
+        This is **not** a switch on ``smearing``. The judgement is on the *converged occupations*,
+        so a gapped system smeared at a ``kT`` well below its gap is accepted — measured, cubic BN
+        on a 4×4×4 mesh at ``smearing=0.3`` passes. Widening ``kT`` is what pushes occupations
+        away from integer; a finer ``kpts`` is the remedy that does not.
     divide_conquer : bool
         Solve with divide-and-conquer instead of one global diagonalization. For large molecules
         only — the crossover against the full SCF is a few hundred atoms — and molecular systems
@@ -115,6 +148,21 @@ class AM1(Calculator):
         "p_tol": 1.0e-7,
         "max_scf": 300,
         "mixing": 0.3,
+        # The coupled-perturbed solve behind any Hessian, infrared spectrum or phonon. `None`
+        # keeps the crate defaults; these were private constants through 0.2.2, so a system whose
+        # response needed more passes could not be given them from here at all.
+        "cphf_max_iter": None,
+        "cphf_tol": None,
+        # Run a periodic *response* even when the ground state has fractionally occupied levels.
+        # A calculator parameter rather than an argument to each `get_*`, because it is a property
+        # of the system being outside what the equations cover, not of the question being asked --
+        # a structure that needs it needs it for the Hessian, the Born charges and DFPT alike.
+        #
+        # The default refuses. Every response path derives from a fixed integer occupation, and
+        # through 0.2.2 they ran anyway and were wrong without saying so. This does not gate
+        # smearing: the judgement is on the converged occupations, so a gapped system smeared well
+        # below its gap is accepted.
+        "allow_fractional_occupations": False,
         "divide_conquer": False,
         "core_size": 12,
         "buffer_radius": 11.0,
@@ -439,6 +487,7 @@ class AM1(Calculator):
                     method=method,
                     realspace_cutoff=self.parameters["realspace_cutoff"],
                     exchange_cutoff=self.parameters["exchange_cutoff"],
+                    allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
                 ),
             )
         else:
@@ -576,6 +625,8 @@ class AM1(Calculator):
                 field,
                 orbital_response=want_response,
                 response_density=want_density,
+                cphf_max_iter=self.parameters["cphf_max_iter"],
+                cphf_tol=self.parameters["cphf_tol"],
             ),
         )
 
@@ -686,19 +737,59 @@ class AM1(Calculator):
         )
         return r
 
-    def optimize(self, atoms=None, apply=True):
+    def optimize(self, atoms=None, apply=True, relax_cell=False, pressure=0.0):
         """L-BFGS geometry optimization on the analytic gradient.
 
         Returns the optimized positions in Å. With ``apply`` (the default) the positions are
         written back into `atoms`, which is what ASE users expect from an in-place relaxation;
         pass ``apply=False`` to leave the structure alone.
 
-        ASE has its own optimizers, and for anything beyond a plain relaxation they are the
-        better choice — this is here so the ASE surface exposes what the native one does.
+        **Periodic structures relax too, since 0.2.3.** When ``atoms.pbc`` has any true entry this
+        drives on the k-point forces, and with ``relax_cell`` on the analytic stress as well, at
+        an optional target ``pressure`` (eV per Bohr^d). The relaxed cell is written back into
+        ``atoms`` along with the positions — with ``relax_cell`` the positions alone do not
+        describe the structure, so returning only those would be a trap.
+
+        A strain component is a variable only when both of its axes are periodic, so a slab's
+        vacuum direction and a chain's two transverse directions stay put by construction.
+
+        ASE has its own optimizers and filters, and for anything beyond a plain relaxation they
+        are the better choice — this is here so the ASE surface exposes what the native one does.
         """
         atoms = self._require_atoms(atoms, "optimize")
-        self._molecular_only(atoms, "optimize")
         charge, multiplicity, reference, method, field = self._resolve_state(atoms)
+        if atoms.pbc.any():
+            if field is not None:
+                raise ValueError(
+                    "a periodic relaxation with an external field is not implemented: the field "
+                    "must be orthogonal to every lattice vector, which the optimizer would have "
+                    "to keep true as the cell deforms"
+                )
+            r = native.pbc_optimize(
+                atoms.get_atomic_numbers(),
+                atoms.get_positions(),
+                atoms.get_cell()[:],
+                atoms.pbc,
+                kpts=self._kpts(),
+                charge=charge,
+                multiplicity=multiplicity,
+                unrestricted=(reference == "uhf"),
+                method=method,
+                smearing_ev=self.parameters["smearing"] or 0.0,
+                realspace_cutoff=self.parameters["realspace_cutoff"],
+                exchange_cutoff=self.parameters["exchange_cutoff"],
+                relax_cell=bool(relax_cell),
+                pressure=float(pressure),
+            )
+            positions = np.asarray(r["positions_angstrom"], dtype=float)
+            if apply:
+                atoms.set_cell(np.asarray(r["cell_angstrom"], dtype=float))
+                atoms.set_positions(positions)
+                self.reset()
+            return positions
+
+        if relax_cell:
+            raise ValueError("relax_cell needs a periodic cell; this structure has none")
         r = native.optimize(
             atoms.get_atomic_numbers(),
             atoms.get_positions(),
@@ -718,12 +809,32 @@ class AM1(Calculator):
 
     # ---------------------------------------------------------------------- periodic response
 
-    def get_phonons(self, atoms=None, supercell=(2, 2, 2), q_points=None):
+    def get_phonons(self, atoms=None, supercell=(2, 2, 2), q_points=None, eigenvectors=False):
         """Phonon frequencies (cm⁻¹) from supercell force constants.
 
         ``supercell`` is the convergence knob and controls two things at once: how far ``Φ(T)``
         is resolved, and — since Γ on an ``n``-fold supercell is the primitive cell at ``n``
         k-points — the k-sampling underneath. Cost grows as the supercell's atom count cubed.
+
+        ``eigenvectors=True`` adds the mode vectors, as **complex ndarrays** of shape
+        ``(n_q, 3N, 3N)`` — this layer joins the real and imaginary halves that
+        :func:`am1_rs.native.phonons` returns separately, since an ASE caller has numpy anyway:
+
+        ``polarization``
+            the orthonormal eigenvectors ``e(q)`` of the mass-weighted dynamical matrix. Use
+            these to sum over modes — intensities, Debye–Waller, occupations.
+        ``displacements``
+            ``e_a / √m_a``, what the atoms actually do. Use these to *move* a structure along a
+            mode; they are not renormalized, so heavy and light atoms keep their true relative
+            amplitude::
+
+                r = atoms.calc.get_phonons(atoms, eigenvectors=True)
+                u = r["displacements"][0][:, 6].real.reshape(-1, 3)   # mode 6 at the first q
+                atoms.positions += 0.1 * u / np.abs(u).max()
+
+        Columns are modes in both, ordered like ``frequencies_cm[iq]``, three components per atom
+        in x, y, z order. Off by default: a band structure over a few hundred q points is a large
+        array and most callers want only the frequencies.
         """
         atoms = self._require_atoms(atoms, "get_phonons")
         if not atoms.pbc.any():
@@ -732,20 +843,24 @@ class AM1(Calculator):
             )
         charge, multiplicity, _, method, _ = self._resolve_state(atoms)
         return self._cached(
-            self._arg_key("phonons", supercell, q_points),
+            self._arg_key("phonons", supercell, q_points, bool(eigenvectors)),
             atoms,
-            lambda: native.phonons(
-                atoms.get_atomic_numbers(),
-                atoms.get_positions(),
-                np.asarray(atoms.get_cell(), dtype=float),
-                atoms.pbc,
-                supercell=supercell,
-                q_points=q_points,
-                charge=charge,
-                multiplicity=multiplicity,
-                method=method,
-                realspace_cutoff=self.parameters["realspace_cutoff"],
-                exchange_cutoff=self.parameters["exchange_cutoff"],
+            lambda: _join_complex(
+                native.phonons(
+                    atoms.get_atomic_numbers(),
+                    atoms.get_positions(),
+                    np.asarray(atoms.get_cell(), dtype=float),
+                    atoms.pbc,
+                    supercell=supercell,
+                    q_points=q_points,
+                    charge=charge,
+                    multiplicity=multiplicity,
+                    method=method,
+                    realspace_cutoff=self.parameters["realspace_cutoff"],
+                    exchange_cutoff=self.parameters["exchange_cutoff"],
+                    eigenvectors=bool(eigenvectors),
+                ),
+                ("polarization", "displacements"),
             ),
         )
 
@@ -754,7 +869,7 @@ class AM1(Calculator):
         q_points,
         atoms=None,
         long_range="auto",
-        cpscf_tol=1.0e-10,
+        cpscf_tol=1.0e-8,
         cpscf_max_iter=200,
         cpscf_mixing=0.7,
     ):
@@ -793,6 +908,7 @@ class AM1(Calculator):
                 cpscf_tol=cpscf_tol,
                 cpscf_max_iter=cpscf_max_iter,
                 cpscf_mixing=cpscf_mixing,
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
 
@@ -845,6 +961,7 @@ class AM1(Calculator):
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
                 enforce_acoustic_sum_rule=enforce_acoustic_sum_rule,
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
 
@@ -871,6 +988,7 @@ class AM1(Calculator):
                 method=method,
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
         return np.asarray(r["born_charges"], dtype=float)
@@ -908,6 +1026,7 @@ class AM1(Calculator):
                 method=method,
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
         return np.asarray(r["epsilon_infinity"], dtype=float)
@@ -970,6 +1089,7 @@ class AM1(Calculator):
                 method=method,
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
         if full:
@@ -1002,6 +1122,7 @@ class AM1(Calculator):
                 method=method,
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
         return np.asarray(r["polarizability_bohr3"], dtype=float)
@@ -1046,6 +1167,7 @@ class AM1(Calculator):
                 method=method,
                 realspace_cutoff=self.parameters["realspace_cutoff"],
                 exchange_cutoff=self.parameters["exchange_cutoff"],
+                allow_fractional_occupations=self.parameters["allow_fractional_occupations"],
             ),
         )
     def get_polarization(self, atoms=None, strings: int = 8):

@@ -69,7 +69,6 @@
 use std::collections::HashMap;
 
 use crate::basis::Basis;
-use crate::data_tables::MASS;
 use crate::error::{Am1Error, Result};
 use crate::lattice::{ImageOffset, Lattice};
 use crate::linalg::Matrix;
@@ -82,6 +81,24 @@ use crate::system::{Atom, Molecule};
 
 /// `sqrt(eV / (Å²·amu))` → cm⁻¹, the same conversion the molecular vibrational analysis uses.
 pub const SQRT_EV_PER_ANG2_AMU_TO_CM: f64 = crate::hessian::SQRT_EV_PER_ANG2_AMU_TO_CM;
+
+/// One `q` point's phonons: the frequencies and the vectors that go with them.
+///
+/// See [`ForceConstants::modes`] for why both vector conventions are returned rather than one.
+#[derive(Clone, Debug)]
+pub struct PhononModes {
+    /// Harmonic frequencies (cm⁻¹), ascending. Negative denotes an imaginary mode.
+    pub frequencies_cm: Vec<f64>,
+    /// Mass-weighted polarization vectors `e(q)`, `3N × 3N`, **columns** are modes and are
+    /// orthonormal. Column `k` matches `frequencies_cm[k]`.
+    pub polarization: CMatrix,
+    /// Cartesian displacements `e_a / √m_a`, same shape, columns are modes.
+    ///
+    /// Deliberately **not** renormalized: the normalization lives on `polarization`, and rescaling
+    /// these would silently change what a displacement along a mode means. This is the matching
+    /// convention to [`crate::hessian::VibrationalModes::cartesian_displacements`].
+    pub displacements: CMatrix,
+}
 
 /// Real-space force constants of a periodic system, resolved by lattice translation.
 #[derive(Clone, Debug)]
@@ -118,6 +135,69 @@ fn supercell_cells(supercell: [usize; 3]) -> Vec<(usize, [i32; 3])> {
             }
         }
     }
+    out
+}
+
+/// Every translation congruent to `t` modulo the supercell lattice that puts `delta = r_b − r_a`
+/// at the shortest distance — the Wigner–Seitz images of the pair, plural when they tie.
+///
+/// Searching `−1, 0, +1` supercell periods along each axis is enough: `t` already lies inside one
+/// supercell period, so the nearest congruent translation cannot be more than one period away.
+/// A non-periodic axis, or one the supercell does not repeat along, contributes only `0` — there
+/// is no other image to fold onto.
+///
+/// The tie tolerance is on the *squared* distance and relative to the cell, so it scales with the
+/// lattice rather than being an absolute length that would be too tight for a large cell and too
+/// loose for a small one.
+fn minimum_images(
+    lattice: &Lattice,
+    supercell: [usize; 3],
+    t: [i32; 3],
+    delta: Vec3,
+) -> Vec<ImageOffset> {
+    let span = |axis: usize| -> i32 {
+        if lattice.periodic[axis] {
+            1
+        } else {
+            0
+        }
+    };
+    let mut best = f64::INFINITY;
+    let mut candidates: Vec<(ImageOffset, f64)> = Vec::new();
+    for i in -span(0)..=span(0) {
+        for j in -span(1)..=span(1) {
+            for k in -span(2)..=span(2) {
+                let n = [
+                    t[0] + i * supercell[0] as i32,
+                    t[1] + j * supercell[1] as i32,
+                    t[2] + k * supercell[2] as i32,
+                ];
+                let offset = ImageOffset { n };
+                let d2 = (delta + lattice.translation(offset)).norm2();
+                if d2 < best {
+                    best = d2;
+                }
+                candidates.push((offset, d2));
+            }
+        }
+    }
+    // Relative on the scale of a lattice vector: two images are "the same distance" when the
+    // difference is below what the geometry can resolve, not below a fixed number of Bohr.
+    let scale = lattice
+        .cell
+        .col
+        .iter()
+        .fold(1.0_f64, |m, v| m.max(v.norm2()));
+    let tolerance = 1.0e-8 * scale;
+    let mut out: Vec<ImageOffset> = candidates
+        .into_iter()
+        .filter(|(_, d2)| *d2 <= best + tolerance)
+        .map(|(offset, _)| offset)
+        .collect();
+    // A fixed order so that the `HashMap` insertion sequence — and therefore nothing at all — is
+    // the same on every run. See `ordered_blocks`.
+    out.sort_unstable_by_key(|offset| offset.n);
+    out.dedup_by_key(|offset| offset.n);
     out
 }
 
@@ -168,9 +248,36 @@ pub fn build_supercell(primitive: &Molecule, supercell: [usize; 3]) -> Result<Mo
 impl ForceConstants {
     /// Force constants from the Γ Hessian of a supercell.
     ///
-    /// `Φ_ab(T)` is read directly off that Hessian: the force constant coupling atom `a` of the
-    /// home cell to atom `b` of the cell at `T`. Translational invariance means only the home
-    /// cell's rows are needed.
+    /// `Φ_ab(T)` is the force constant coupling atom `a` of the home cell to atom `b` of the cell
+    /// at `T`. Translational invariance means only the home cell's rows are needed.
+    ///
+    /// # The translation the Hessian element belongs to is not the one it is indexed by
+    ///
+    /// A supercell's Γ Hessian is an **aliased** sum,
+    ///
+    /// ```text
+    /// H_{(0,a),(t,b)} = Σ_N Φ_ab(T_t + N)
+    /// ```
+    ///
+    /// over the supercell lattice `N`, because the supercell is itself periodic. Reading the
+    /// element off as `Φ_ab(T_t)` — which is what releases through 0.2.2 did — assigns it to the
+    /// translation the *atom list* happened to be built with, and `supercell_cells` builds them
+    /// as `0, 1, … n−1` along each axis. For `n = 3` that labels the neighbour on one side `+2`
+    /// when it is physically at `−1`.
+    ///
+    /// At a **commensurate** `q = m/n` the two labels give the same Bloch phase
+    /// (`e^{2πi m(n−1)/n} = e^{−2πi m/n}`), which is why every test that only ever asked for the
+    /// `q` points the supercell represents exactly could not see this. Anywhere else they do not:
+    /// on a 3× chain at the zone boundary `q = ½` the phase is `+1` under the old labelling and
+    /// `−1` under the right one. Every interpolated band — that is, every band-structure plot —
+    /// was wrong between the commensurate points.
+    ///
+    /// The fix is the standard one: assign each atom-pair block to the **minimum image** of
+    /// `r_b + T − r_a` over `T ≡ T_t` (mod the supercell lattice), splitting equally when several
+    /// images tie. Splitting matters as much as folding: picking one of a tied pair by index
+    /// order would break the point-group symmetry the tie exists because of, and the two halves
+    /// at `±T` are what make `Φ(T) = Φ(−T)ᵀ` hold — which is the property `dynamical_matrix`
+    /// used to have to repair with `hermitianize`.
     pub fn from_supercell(
         primitive: &Molecule,
         params: &Am1Parameters,
@@ -186,24 +293,40 @@ impl ForceConstants {
 
         let mut blocks: HashMap<ImageOffset, Matrix> = HashMap::new();
         for (cell_index, t) in supercell_cells(supercell) {
-            let mut block = Matrix::zeros(3 * nat, 3 * nat);
             for a in 0..nat {
                 // Home cell is index 0 by construction of `supercell_cells`.
                 let row_atom = supercell_atom_index(0, a, nat);
                 for b in 0..nat {
                     let col_atom = supercell_atom_index(cell_index, b, nat);
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            block[(3 * a + i, 3 * b + j)] =
-                                hessian[(3 * row_atom + i, 3 * col_atom + j)];
+                    let images = minimum_images(
+                        &cell,
+                        supercell,
+                        t,
+                        primitive.atoms[b].position - primitive.atoms[a].position,
+                    );
+                    let share = 1.0 / images.len() as f64;
+                    for image in images {
+                        let block = blocks
+                            .entry(image)
+                            .or_insert_with(|| Matrix::zeros(3 * nat, 3 * nat));
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                block[(3 * a + i, 3 * b + j)] +=
+                                    share * hessian[(3 * row_atom + i, 3 * col_atom + j)];
+                            }
                         }
                     }
                 }
             }
-            blocks.insert(ImageOffset { n: t }, block);
         }
 
-        let masses = primitive.atoms.iter().map(|a| MASS[a.z as usize]).collect();
+        // `atomic_mass`, not `MASS[z]`: a gap in the table is a `1/0` in every dynamical matrix
+        // built from these, and it should say so here rather than at the eigensolver.
+        let masses = primitive
+            .atoms
+            .iter()
+            .map(|a| crate::data_tables::atomic_mass(a.z))
+            .collect::<Result<Vec<f64>>>()?;
 
         Ok(Self {
             blocks,
@@ -261,8 +384,11 @@ impl ForceConstants {
                 }
             }
         }
-        // `Φ(T)` truncated at the supercell boundary is not exactly symmetric under `T → −T`,
+        // `Φ(T)` truncated at the supercell boundary is not *exactly* symmetric under `T → −T`,
         // so symmetrize rather than let a tiny anti-Hermitian part produce complex frequencies.
+        // Since the minimum-image folding in `from_supercell` the residue is small — measured at
+        // 6e-11 against a 9.8 eV/Bohr² scale on an H₂ chain, where filing the blocks by index
+        // order left 7e-3 — but it is not zero, and this costs nothing.
         d.hermitianize();
         d
     }
@@ -409,8 +535,39 @@ impl ForceConstants {
 
     /// Harmonic frequencies at `q`, cm⁻¹, ascending. Negative denotes an imaginary mode.
     pub fn frequencies(&self, q: KPoint) -> Result<Vec<f64>> {
-        let eigen = hermitian_eigen(&self.dynamical_matrix(q))?;
-        Ok(eigen
+        Ok(self.modes(q)?.frequencies_cm)
+    }
+
+    /// The phonons at `q`: frequencies **and** the vectors that say what moves.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::frequencies`] returns a list of numbers, and a list of numbers cannot answer the
+    /// question a phonon calculation is usually run to answer. Tracing an imaginary mode on
+    /// trimethylaluminium needed its eigenvector and there was no way to get one from here at all
+    /// — the direction had to be borrowed from the *molecular* Hessian at the same geometry, which
+    /// works only because the two agree in a large cell and is not a general answer.
+    ///
+    /// # Two vectors, and they are not the same
+    ///
+    /// The dynamical matrix is mass-weighted, so its eigenvectors are the **polarization vectors**
+    /// `e(q)` — orthonormal, `eᵀe = 1`, and the right thing for anything that sums over modes
+    /// (structure factors, mode Grüneisen parameters, electron–phonon matrix elements). What an
+    /// atom actually *does* is `u_a = e_a / √m_a`, which is not normalized and is the right thing
+    /// for displacing a structure along a mode. Both are returned rather than one, because
+    /// choosing for the caller is how a factor of `√m` gets silently applied twice.
+    ///
+    /// Complex, unlike the molecular case: at `q ≠ 0` the pattern carries a Bloch phase between
+    /// cells, and the imaginary part is that phase rather than a numerical residue.
+    pub fn modes(&self, q: KPoint) -> Result<PhononModes> {
+        self.modes_of(&self.dynamical_matrix(q))
+    }
+
+    /// [`Self::modes`] on a dynamical matrix already built — with the LO–TO term, say.
+    pub fn modes_of(&self, d: &CMatrix) -> Result<PhononModes> {
+        let eigen = hermitian_eigen(d)?;
+        let n = 3 * self.nat;
+        let frequencies_cm = eigen
             .values
             .iter()
             .map(|&lambda| {
@@ -420,7 +577,26 @@ impl ForceConstants {
                     -SQRT_EV_PER_ANG2_AMU_TO_CM * (-lambda).sqrt()
                 }
             })
-            .collect())
+            .collect();
+        let polarization = CMatrix {
+            n,
+            re: eigen.vectors_re,
+            im: eigen.vectors_im,
+        };
+        let mut displacements = polarization.clone();
+        for row in 0..n {
+            // Row `3a + i` belongs to atom `a`, so the mass is the atom's, not the mode's.
+            let inv_sqrt_m = 1.0 / self.masses[row / 3].sqrt();
+            for col in 0..n {
+                displacements.re[(row, col)] *= inv_sqrt_m;
+                displacements.im[(row, col)] *= inv_sqrt_m;
+            }
+        }
+        Ok(PhononModes {
+            frequencies_cm,
+            polarization,
+            displacements,
+        })
     }
 
     /// Frequencies along a path of `q` points, one row per point.
@@ -477,16 +653,143 @@ impl ForceConstants {
         worst
     }
 
-    /// Impose the acoustic sum rule by correcting the on-site block.
+    /// `max |Φ_ab(T) − Φ_ba(−T)ᵀ|`, in eV/Bohr².
     ///
-    /// `Φ_aa(0) ← Φ_aa(0) − Σ_{T,b} Φ_ab(T)`, which is the standard fix: the self-term is the one
-    /// least determined by the calculation, and forcing the sum through it guarantees three
-    /// modes go to exactly zero at `q = 0` rather than to whatever the truncation left behind.
+    /// The second derivative of the energy does not care which of two atoms is differentiated
+    /// first, so this is exactly zero for the true force constants. What it measures here is the
+    /// residue of the real-space and exchange cutoffs: the supercell's Γ Hessian is only
+    /// translationally invariant to the extent that those truncations are, and
+    /// `Φ_ab(T) = H[(0,a),(T,b)]` versus `Φ_ba(−T) = H[(0,b),(−T,a)]` reads two *different*
+    /// elements of it.
     ///
-    /// This is a **correction, not a refinement** — it moves error into the on-site block rather
-    /// than removing it. [`Self::acoustic_sum_rule_error`] before calling this is the honest
-    /// measure of how much was wrong.
+    /// Measured on graphene in a 2×2 supercell: **8.2e-4** against a `|Φ|` of 18.7 eV/Bohr², and
+    /// that is the number that used to put diamond's acoustic modes at −275 cm⁻¹. See
+    /// [`Self::enforce_acoustic_sum_rule`].
+    pub fn transpose_asymmetry(&self) -> f64 {
+        let ndof = 3 * self.nat;
+        let mut worst = 0.0_f64;
+        for (offset, block) in self.ordered_blocks() {
+            let mirror = self.blocks.get(&offset.negated());
+            for i in 0..ndof {
+                for j in 0..ndof {
+                    let other = mirror.map_or(0.0, |m| m[(j, i)]);
+                    worst = worst.max((block[(i, j)] - other).abs());
+                }
+            }
+        }
+        worst
+    }
+
+    /// Impose `Φ_ab(T) = Φ_ba(−T)ᵀ` by averaging each block with its mirror.
+    ///
+    /// Creates the mirror block when it is missing, which is why the translation set comes out
+    /// symmetric under negation afterwards.
+    pub fn symmetrize_transpose(&mut self) {
+        let ndof = 3 * self.nat;
+        let offsets: Vec<ImageOffset> = {
+            let mut v: Vec<ImageOffset> = self.blocks.keys().copied().collect();
+            // Fixed order; see `ordered_blocks`. Averaging is order-independent, but *creating*
+            // the missing mirrors is not — a mirror created inside the loop would be averaged
+            // again when its own turn came.
+            v.sort_unstable_by_key(|o| o.n);
+            v
+        };
+        for offset in &offsets {
+            self.blocks
+                .entry(offset.negated())
+                .or_insert_with(|| Matrix::zeros(ndof, ndof));
+        }
+        let mut averaged: HashMap<ImageOffset, Matrix> = HashMap::new();
+        for offset in self.blocks.keys().copied().collect::<Vec<_>>() {
+            let block = &self.blocks[&offset];
+            let mirror = &self.blocks[&offset.negated()];
+            let mut out = Matrix::zeros(ndof, ndof);
+            for i in 0..ndof {
+                for j in 0..ndof {
+                    out[(i, j)] = 0.5 * (block[(i, j)] + mirror[(j, i)]);
+                }
+            }
+            averaged.insert(offset, out);
+        }
+        self.blocks = averaged;
+    }
+
+    /// Impose the acoustic sum rule, and the transpose symmetry it has to share the matrix with.
+    ///
+    /// # Why this is two rules and not one
+    ///
+    /// The sum rule `Σ_{T,b} Φ_ab(T) = 0` is a statement about the **rows** of `Φ`. Imposing it
+    /// through the on-site block — `Φ_aa(0) ← Φ_aa(0) − Σ_{T,b} Φ_ab(T)`, the standard fix, since
+    /// the self-term is the one least determined by the calculation — makes the row sums vanish
+    /// exactly.
+    ///
+    /// That is not enough to put three modes at zero, and through 0.2.2 it did not.
+    /// [`Self::dynamical_matrix`] symmetrizes `D(q)` before diagonalizing it, so the spectrum
+    /// sees the *average* of the row and column sums, and the column sums are only zero if
+    /// `Φ_ab(T) = Φ_ba(−T)ᵀ`. The supercell Hessian satisfies that only as well as its real-space
+    /// and exchange cutoffs do. Measured on graphene: row sums `1.8e-9`, column sums `8.2e-4`.
+    /// **Diamond in its fcc primitive cell came out with acoustic modes at −275, −275 and −65
+    /// cm⁻¹ while `acoustic_sum_rule_error()` read `1.2e-15`** — the sum rule genuinely held, and
+    /// it was the wrong sum rule to hold alone.
+    ///
+    /// So the two are imposed together, by **alternating projection**: symmetrize, impose the row
+    /// sums, repeat.
+    ///
+    /// # Where the alternation stops, and why that is the right place
+    ///
+    /// It does not reach zero, and the reason is worth stating rather than iterating against. The
+    /// row-sum step subtracts `R_a = Σ_{T,b} Φ_ab(T)` from `Φ_aa(0)`, and `Φ_aa(0)` must be
+    /// symmetric for the transpose symmetry to hold. Splitting `R_a` into its symmetric and
+    /// antisymmetric parts, the symmetrization removes `sym(R_a)` and puts the row sum back at
+    /// `antisym(R_a)`; the next row-sum step removes that and breaks the symmetry by the same
+    /// amount. The alternation therefore has a **fixed point** at `|antisym(R_a)|`, reached in a
+    /// few passes, and more passes do nothing. Measured on graphene: `4.1e-4 → 6.5e-6` and then
+    /// stationary.
+    ///
+    /// `antisym(R_a)` is a **rotational** sum-rule residue — the translational rule constrains
+    /// only the symmetric part — and it is left behind by the real-space and exchange cutoffs
+    /// rather than by anything this routine could fix. On graphene it is `6.5e-6` eV/Bohr²
+    /// against a `|Φ|` of 18.7, which reaches the acoustic branch as **0.7 cm⁻¹**. The three
+    /// acoustic frequencies come out below the precision the output is printed to, which is the
+    /// property that matters; driving the matrix element itself to zero would mean moving that
+    /// error somewhere less visible, not removing it.
+    ///
+    /// Each pass is `O(#T · nat² · 9)` floating-point operations on a matrix the Hessian already
+    /// paid `O(nat³)` to produce, so the iteration is free in every practical sense.
+    ///
+    /// This is a **correction, not a refinement**: it moves truncation error into the on-site
+    /// block rather than removing it. [`Self::acoustic_sum_rule_error`] and
+    /// [`Self::transpose_asymmetry`] *before* calling this are the honest measure of how much was
+    /// wrong.
     pub fn enforce_acoustic_sum_rule(&mut self) {
+        let scale = self
+            .blocks
+            .values()
+            .flat_map(|m| m.as_slice().iter())
+            .fold(0.0_f64, |x, v| x.max(v.abs()))
+            .max(1.0);
+        let target = 1.0e-13 * scale;
+        let mut previous = f64::INFINITY;
+        for _ in 0..16 {
+            self.symmetrize_transpose();
+            self.enforce_row_sum_rule();
+            let residual = self.transpose_asymmetry();
+            // Stop at the fixed point as well as at roundoff: once a pass stops improving things
+            // by more than a tenth, the remainder is the rotational residue described above and
+            // further passes only move it between the two constraints.
+            if residual <= target || residual > 0.9 * previous {
+                break;
+            }
+            previous = residual;
+        }
+        // The row sums go last: after the final symmetrization they and the column sums are the
+        // same quantity, and `q = 0` is where they have to be zero.
+        self.symmetrize_transpose();
+        self.enforce_row_sum_rule();
+    }
+
+    /// The row-sum half of [`Self::enforce_acoustic_sum_rule`], on its own.
+    fn enforce_row_sum_rule(&mut self) {
         let origin = ImageOffset::origin();
         let mut corrections = vec![[[0.0_f64; 3]; 3]; self.nat];
         {

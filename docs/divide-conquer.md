@@ -320,6 +320,45 @@ taper. `tests/dc_periodic.rs` checks convergence to the full periodic SCF as the
 r = am1_rs.divide_conquer(numbers, positions, cell=cell, pbc=[True] * 3, buffer_radius=14.0)
 ```
 
+### From the command line
+
+Since 0.2.3, `--dc` on the `energy`, `gradient` and `optimize` modes, with `--dc-core N` (target
+atoms per core region, 12) and `--dc-buffer R` (buffer radius in **Ångström**, 5.82); either of the
+latter implies `--dc`.
+
+```
+am1-rs energy   cluster.xyz --dc --dc-buffer 7.0
+am1-rs optimize cluster.xyz --dc --opt-output relaxed.xyz
+```
+
+A mode `--dc` does not cover **refuses** rather than ignoring the flag. `frequencies --dc` would
+return full-SCF frequencies at full-SCF cost — the exact thing a user reaching for `--dc` is trying
+to avoid — and doing that silently is worse than saying so.
+
+### Geometry optimization
+
+Since 0.2.3 the gradient drives an L-BFGS relaxation, so a structure too large for one full SCF can
+be relaxed and not only measured: `optimize_divide_conquer` in Rust, `optimize=True` on
+`native.divide_conquer` (with `opt_max_iter` and `opt_gtol`), `--dc` on the CLI's `optimize`.
+
+Two things about it that a single-point user does not have to think about:
+
+- **The line search accepts `E_dc`, not the full-SCF energy at the same geometry.** `E_dc` is what
+  the gradient differentiates, so it is the function whose stationary point this is looking for.
+  Testing the Armijo condition against a different functional would accept steps that do not
+  decrease the thing being minimized — and the two differ by exactly the buffer's error, which is
+  the size a line search notices and an energy report does not.
+- **The buffer radius is doing more work here.** A gradient error tolerable for one energy
+  accumulates along a path, and the convergence in `buffer_radius` is not monotonic, so a *larger*
+  buffer does not guarantee a closer minimum. Relax at two buffers before trusting a geometry.
+
+With Fermi filling the variational quantity is the free energy `E − TS`, and that is what the
+search descends. Whether the analytic force differentiates `E` or `E − TS` is **not settled by any
+test here**: `tests/dc_optimize.rs` finite-differences both on a water trimer and gets the same
+number to eight digits, because a 16 eV gap at `kt = 0.1 eV` leaves the entropy identically zero.
+The free energy is the safe choice — it is what a finite-temperature ensemble minimizes — but a
+partially occupied system would be needed to settle it, and there is none in the suite.
+
 ---
 
 ## Memory

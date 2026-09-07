@@ -77,12 +77,31 @@ fn molecular_options(
     reference: &str,
     field: Option<Vec<f64>>,
 ) -> PyResult<Am1Options> {
+    molecular_options_with(charge, multiplicity, reference, field, None, None)
+}
+
+/// [`molecular_options`] with the response solver's limits, for the entry points that run one.
+///
+/// `None` keeps [`Am1Options`]'s defaults. Exposed because through 0.2.2 these were private
+/// constants: a molecule whose CPHF needed more than a hundred passes could not be given them from
+/// either API.
+fn molecular_options_with(
+    charge: f64,
+    multiplicity: usize,
+    reference: &str,
+    field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
+    cphf_tol: Option<f64>,
+) -> PyResult<Am1Options> {
+    let base = Am1Options::default();
     Ok(Am1Options {
         charge,
         multiplicity,
         reference: parse_reference(reference)?,
         electric_field: field_from(field)?,
-        ..Am1Options::default()
+        cphf_max_iter: cphf_max_iter.unwrap_or(base.cphf_max_iter),
+        cphf_tol: cphf_tol.unwrap_or(base.cphf_tol),
+        ..base
     })
 }
 
@@ -376,10 +395,28 @@ fn pbc_point(
     let d = PyDict::new(py);
     d.set_item("energy_ev", scf.total_ev)?;
     d.set_item("energy_hartree", scf.total_ev * EV_TO_HARTREE)?;
+    // The two halves of the total. The molecular `single_point` has reported them since 0.1;
+    // this did not, so anything wanting the same breakdown for a cell — the CLI's periodic
+    // `energy` mode, for one — had no way to get it and raised `KeyError` reaching for it.
+    d.set_item("electronic_ev", scf.electronic_ev)?;
+    d.set_item("core_ev", scf.core_ev)?;
+    d.set_item("band_energy_ev", scf.band_energy_ev)?;
+    d.set_item("converged", scf.converged)?;
     d.set_item("free_energy_ev", scf.free_energy_ev())?;
     d.set_item("forces_ev_per_angstrom", forces)?;
+    // The same number the Rust CLI prints, rather than one recomputed from the eV/Å forces: the
+    // two differ in the last bit after the unit round trip, which is invisible everywhere except
+    // in a `{:.6e}` field, where it made the two front ends disagree about `max |grad|`.
+    d.set_item("max_gradient_ev_per_bohr", grad.max_gradient)?;
     d.set_item("stress_voigt", voigt)?;
     d.set_item("stress_matrix", stress_matrix)?;
+    // The same stress in the crate's own eV/Bohr^d, unconverted. The `stress_voigt` above is in
+    // eV/Å^d because that is what ASE's `results["stress"]` means; a caller working in atomic
+    // units — the CLI, for one — would otherwise have to redo the `(Bohr per Å)^d` conversion,
+    // and `d` is the number of *periodic* directions rather than 3. Doing that arithmetic twice
+    // in two languages is how the two front ends came to print stresses differing by exactly
+    // 1.8898 for a chain.
+    d.set_item("stress_voigt_ev_per_bohr", grad.stress_voigt())?;
     d.set_item("charges", scf.charges.clone())?;
     d.set_item("fermi_energy_ev", scf.fermi_energy_ev)?;
     d.set_item("entropy_ev", scf.entropy_ev)?;
@@ -387,6 +424,7 @@ fn pbc_point(
     d.set_item("iterations", scf.iterations)?;
     d.set_item("n_periodic", n_periodic)?;
     d.set_item("max_image_overlap", scf.max_image_overlap)?;
+    d.set_item("unrestricted", scf.unrestricted)?;
     d.set_item("charged_cell_warning", scf.charged_cell_warning.clone())?;
     Ok(d.into())
 }
@@ -412,10 +450,14 @@ fn component_of(v: &crate::math::Vec3, index: usize) -> f64 {
 #[pyo3(signature = (
     numbers, positions,
     charge=0.0, multiplicity=1, reference="auto", method="am1",
+    // Kept in step with DcOptions::default() by tests/dc_optimize.rs, which asserts that the
+    // two agree -- three front ends resolving to three different partitions is what this file
+    // used to do.
     core_size=12, buffer_radius=11.0, smearing_ev=0.05,
     e_tol=1.0e-7, p_tol=1.0e-6, max_scf=300, mixing=0.4, gap_warn_ev=0.5,
     forces=true, multipole_cutoff=None, electric_field=None,
-    cell=None, pbc=None, realspace_cutoff=40.0, exchange_cutoff=20.0
+    cell=None, pbc=None, realspace_cutoff=40.0, exchange_cutoff=20.0,
+    optimize=false, opt_max_iter=200, opt_gtol=1.0e-3
 ))]
 fn divide_conquer(
     py: Python<'_>,
@@ -440,8 +482,13 @@ fn divide_conquer(
     pbc: Option<Vec<bool>>,
     realspace_cutoff: f64,
     exchange_cutoff: f64,
+    optimize: bool,
+    opt_max_iter: usize,
+    opt_gtol: f64,
 ) -> PyResult<PyObject> {
-    use crate::divide_conquer::{divide_conquer_gradient, run_divide_conquer, DcOptions};
+    use crate::divide_conquer::{
+        divide_conquer_gradient, optimize_divide_conquer, run_divide_conquer, DcOptions,
+    };
     use crate::fermi::Filling;
 
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
@@ -495,15 +542,35 @@ fn divide_conquer(
         gap_warn_ev,
     };
 
-    let (r, gradient) = py
+    // `optimize` is a flag here rather than a second `dc_optimize` function, unlike the periodic
+    // pair. A periodic relaxation takes cell and pressure arguments a single point has no use
+    // for and returns a stress a single point does not have; a divide-and-conquer relaxation
+    // takes two extra numbers and returns the same dictionary plus the geometry it ended at. One
+    // entry point keeps every divide-and-conquer control in one signature.
+    let (mol, r, gradient, opt_state) = py
         .allow_threads(|| -> crate::error::Result<_> {
+            let (mol, opt_state) = if optimize {
+                let opt = crate::optimizer::OptOptions {
+                    max_iter: opt_max_iter,
+                    gtol: opt_gtol,
+                    ..Default::default()
+                };
+                let res = optimize_divide_conquer(&mol, &params, &opts, &dc_opts, &opt)?;
+                let max_force = res.trajectory.last().map(|s| s.max_gradient).unwrap_or(0.0);
+                (
+                    res.molecule,
+                    Some((res.converged, res.iterations, max_force)),
+                )
+            } else {
+                (mol, None)
+            };
             let r = run_divide_conquer(&mol, &params, &opts, &dc_opts)?;
             let g = if forces {
                 Some(divide_conquer_gradient(&mol, &params, &opts, &r)?)
             } else {
                 None
             };
-            Ok((r, g))
+            Ok((mol, r, g, opt_state))
         })
         .map_err(to_py_err)?;
 
@@ -519,6 +586,29 @@ fn divide_conquer(
     d.set_item("energy_hartree", r.total_ev * EV_TO_HARTREE)?;
     d.set_item("free_energy_ev", r.free_energy_ev())?;
     d.set_item("heat_of_formation_kcal", r.heat_of_formation_kcal)?;
+    // The same split the molecular and periodic single points report. Absent through 0.2.2,
+    // which is the shape of gap that made the periodic CLI die on a missing `electronic_ev`.
+    d.set_item("electronic_ev", r.electronic_ev)?;
+    d.set_item("core_ev", r.core_ev)?;
+    d.set_item("converged", r.converged)?;
+    d.set_item(
+        "positions_angstrom",
+        mol.atoms
+            .iter()
+            .map(|a| {
+                [
+                    a.position.x * BOHR_TO_ANGSTROM,
+                    a.position.y * BOHR_TO_ANGSTROM,
+                    a.position.z * BOHR_TO_ANGSTROM,
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    if let Some((converged, steps, max_force)) = opt_state {
+        d.set_item("opt_converged", converged)?;
+        d.set_item("opt_iterations", steps)?;
+        d.set_item("max_force_ev_per_bohr", max_force)?;
+    }
     if let Some(g) = gradient {
         // eV/Bohr -> eV/Å; forces are the negative gradient.
         let f: Vec<[f64; 3]> = g
@@ -575,7 +665,8 @@ fn divide_conquer(
     numbers, positions, cell, pbc, supercell,
     q_points=None, charge=0.0, multiplicity=1, method="am1",
     realspace_cutoff=40.0, exchange_cutoff=20.0,
-    e_tol=1.0e-10, p_tol=1.0e-9, max_scf=500, enforce_acoustic_sum_rule=true
+    e_tol=1.0e-10, p_tol=1.0e-9, max_scf=500, enforce_acoustic_sum_rule=true,
+    eigenvectors=false
 ))]
 fn phonons(
     py: Python<'_>,
@@ -594,6 +685,7 @@ fn phonons(
     p_tol: f64,
     max_scf: usize,
     enforce_acoustic_sum_rule: bool,
+    eigenvectors: bool,
 ) -> PyResult<PyObject> {
     use crate::pbc::kpoints::KPoint;
     use crate::pbc::phonon::ForceConstants;
@@ -629,14 +721,17 @@ fn phonons(
     };
     let repeats = [supercell.0.max(1), supercell.1.max(1), supercell.2.max(1)];
 
-    let (fc, asr_before) = py
+    let (fc, asr_before, transpose_before) = py
         .allow_threads(|| -> crate::error::Result<_> {
             let mut fc = ForceConstants::from_supercell(&mol, &params, &opts, repeats)?;
             let before = fc.acoustic_sum_rule_error();
+            // The *other* sum rule. Reported because the two are independent and only the pair
+            // of them puts three modes at exactly zero; see `enforce_acoustic_sum_rule`.
+            let transpose = fc.transpose_asymmetry();
             if enforce_acoustic_sum_rule {
                 fc.enforce_acoustic_sum_rule();
             }
-            Ok((fc, before))
+            Ok((fc, before, transpose))
         })
         .map_err(to_py_err)?;
 
@@ -659,11 +754,13 @@ fn phonons(
         }],
     };
 
-    let bands: Vec<Vec<f64>> = requested
+    // One diagonalization per `q` either way; `eigenvectors` decides only what is kept from it.
+    let solved: Vec<crate::pbc::phonon::PhononModes> = requested
         .iter()
-        .map(|q| fc.frequencies(*q))
+        .map(|q| fc.modes(*q))
         .collect::<crate::error::Result<Vec<_>>>()
         .map_err(to_py_err)?;
+    let bands: Vec<Vec<f64>> = solved.iter().map(|m| m.frequencies_cm.clone()).collect();
 
     let d = PyDict::new(py);
     d.set_item(
@@ -681,6 +778,30 @@ fn phonons(
     )?;
     d.set_item("acoustic_sum_rule_error_before", asr_before)?;
     d.set_item("acoustic_sum_rule_error", fc.acoustic_sum_rule_error())?;
+    d.set_item("transpose_asymmetry_before", transpose_before)?;
+    d.set_item("transpose_asymmetry", fc.transpose_asymmetry())?;
+    if eigenvectors {
+        // Real and imaginary parts as separate arrays rather than interleaved pairs: this is what
+        // `numpy.asarray(re) + 1j*numpy.asarray(im)` wants, and the consumer of a phonon
+        // eigenvector is almost always numpy.
+        //
+        // `O(n_q · (3N)²)` complex numbers, which is why it is opt-in: a band structure over a
+        // few hundred `q` is a large array, and most callers want the frequencies.
+        let pack = |pick: fn(&crate::pbc::phonon::PhononModes) -> &crate::pbc::complex::CMatrix,
+                    part: bool| {
+            solved
+                .iter()
+                .map(|m| {
+                    let c = pick(m);
+                    matrix_rows(if part { &c.im } else { &c.re })
+                })
+                .collect::<Vec<_>>()
+        };
+        d.set_item("polarization_re", pack(|m| &m.polarization, false))?;
+        d.set_item("polarization_im", pack(|m| &m.polarization, true))?;
+        d.set_item("displacements_re", pack(|m| &m.displacements, false))?;
+        d.set_item("displacements_im", pack(|m| &m.displacements, true))?;
+    }
     d.set_item("method", params.method.name())?;
     Ok(d.into())
 }
@@ -708,7 +829,7 @@ fn phonons(
     numbers, positions, cell, pbc, supercell=(2, 2, 2), direction=(1.0, 0.0, 0.0),
     q_points=None, kpts=(2, 2, 2), charge=0.0, multiplicity=1, method="am1",
     realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500,
-    enforce_acoustic_sum_rule=true
+    enforce_acoustic_sum_rule=true, allow_fractional_occupations=false
 ))]
 fn lo_to_frequencies(
     py: Python<'_>,
@@ -729,6 +850,7 @@ fn lo_to_frequencies(
     p_tol: f64,
     max_scf: usize,
     enforce_acoustic_sum_rule: bool,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     use crate::pbc::kpoints::KPoint;
     use crate::pbc::phonon::ForceConstants;
@@ -747,6 +869,8 @@ fn lo_to_frequencies(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let dir = crate::math::Vec3::new(direction.0, direction.1, direction.2);
     if dir.norm() < 1.0e-12 {
@@ -832,6 +956,20 @@ fn lo_to_frequencies(
     Ok(d.into())
 }
 
+/// Build the periodic molecule and options every response entry point shares.
+///
+/// `smearing_ev` is a parameter rather than a hardcoded zero because the ground state a response
+/// is built on has to converge before the response means anything, and a small-gap or coarsely
+/// sampled system does not converge under sharp aufbau filling. Measured on zincblende AlP: a
+/// 2×2×2 mesh does not converge at all with `smearing_ev = 0` and takes 248 iterations at 0.2 eV.
+/// Every entry point here passed 0 until 0.2.3, so DFPT simply could not be run on such a system
+/// — which is most inorganic solids.
+///
+/// **What smearing does and does not fix.** It converges the *ground state*. The coupled-perturbed
+/// equations solved on top of it assume integer occupations, so a response computed at a genuinely
+/// fractional occupancy is outside what this code derives; use it to reach a converged insulating
+/// state on a coarse mesh, not to describe a metal.
+#[allow(clippy::too_many_arguments)]
 fn periodic_setup(
     numbers: &[u8],
     positions: &[Vec<f64>],
@@ -846,6 +984,8 @@ fn periodic_setup(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    smearing_ev: f64,
+    allow_fractional_occupations: bool,
 ) -> PyResult<(Molecule, Am1Parameters, crate::pbc::PbcOptions)> {
     use crate::pbc::{KMesh, PbcOptions};
     if cell.len() != 3 || cell.iter().any(|v| v.len() != 3) {
@@ -873,12 +1013,13 @@ fn periodic_setup(
         fold_time_reversal: false,
         realspace_cutoff,
         exchange_cutoff: Some(exchange_cutoff),
-        smearing_ev: 0.0,
+        smearing_ev,
         charge,
         multiplicity: multiplicity.max(1),
         e_tol,
         p_tol,
         max_scf,
+        require_integer_occupations: !allow_fractional_occupations,
         ..PbcOptions::default()
     };
     Ok((mol, params, opts))
@@ -891,7 +1032,7 @@ fn periodic_setup(
 #[pyfunction]
 #[pyo3(signature = (
     numbers, positions, cell, pbc, kpts=(2, 2, 2), charge=0.0, multiplicity=1, method="am1",
-    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 fn pbc_hessian(
     py: Python<'_>,
@@ -908,6 +1049,7 @@ fn pbc_hessian(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     let (mol, params, opts) = periodic_setup(
         &numbers,
@@ -923,6 +1065,8 @@ fn pbc_hessian(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let h = py
         .allow_threads(|| crate::pbc::pbc_hessian(&mol, &params, &opts))
@@ -952,7 +1096,7 @@ fn pbc_hessian(
 #[pyfunction]
 #[pyo3(signature = (
     numbers, positions, cell, pbc, kpts=(2, 2, 2), charge=0.0, multiplicity=1, method="am1",
-    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 fn born_charges(
     py: Python<'_>,
@@ -969,6 +1113,7 @@ fn born_charges(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     let (mol, params, opts) = periodic_setup(
         &numbers,
@@ -984,6 +1129,8 @@ fn born_charges(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let z = py
         .allow_threads(|| crate::pbc::born_charges(&mol, &params, &opts))
@@ -1012,7 +1159,7 @@ fn born_charges(
 #[pyfunction]
 #[pyo3(signature = (
     numbers, positions, cell, pbc, kpts=(2, 2, 2), charge=0.0, multiplicity=1, method="am1",
-    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn polarizability(
@@ -1030,6 +1177,7 @@ fn polarizability(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     let (mol, params, opts) = periodic_setup(
         &numbers,
@@ -1045,6 +1193,8 @@ fn polarizability(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let alpha = py
         .allow_threads(|| crate::pbc::polarizability(&mol, &params, &opts))
@@ -1070,7 +1220,7 @@ fn polarizability(
 #[pyo3(signature = (
     numbers, positions, cell, pbc, q, chain_radius=None, kpts=(2, 2, 2), charge=0.0,
     multiplicity=1, method="am1", realspace_cutoff=40.0, exchange_cutoff=20.0,
-    e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn dielectric_function(
@@ -1090,6 +1240,7 @@ fn dielectric_function(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<f64> {
     if q.len() != 3 {
         return Err(PyValueError::new_err("q must have three components"));
@@ -1109,6 +1260,8 @@ fn dielectric_function(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     py.allow_threads(|| crate::pbc::dielectric_function(&mol, &params, &opts, qv, chain_radius))
         .map_err(to_py_err)
@@ -1158,6 +1311,8 @@ fn polarization(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        false,
     )?;
     let r = py
         .allow_threads(|| crate::pbc::berry::berry_polarization(&mol, &params, &opts, strings))
@@ -1227,6 +1382,8 @@ fn finite_field(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        false,
     )?;
     // The Berry phase needs a gapped, integer-filled manifold. `periodic_setup` leaves whatever
     // smearing the shared default carries, and a silent smear would make the phase meaningless —
@@ -1263,7 +1420,7 @@ fn finite_field(
 #[pyfunction]
 #[pyo3(signature = (
     numbers, positions, cell, pbc, kpts=(2, 2, 2), charge=0.0, multiplicity=1, method="am1",
-    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 fn dielectric(
     py: Python<'_>,
@@ -1280,6 +1437,7 @@ fn dielectric(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     let (mol, params, opts) = periodic_setup(
         &numbers,
@@ -1295,6 +1453,8 @@ fn dielectric(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let (alpha, epsilon) = py
         .allow_threads(|| crate::pbc::dielectric_tensor(&mol, &params, &opts))
@@ -1338,7 +1498,7 @@ fn dielectric(
 #[pyo3(signature = (
     numbers, positions, cell, pbc, slab_thickness=None, wire_cross_section=None, kpts=(2, 2, 2),
     charge=0.0, multiplicity=1, method="am1", realspace_cutoff=40.0, exchange_cutoff=20.0,
-    e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500
+    e_tol=1.0e-11, p_tol=1.0e-10, max_scf=500, allow_fractional_occupations=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn dielectric_with_extent(
@@ -1358,6 +1518,7 @@ fn dielectric_with_extent(
     e_tol: f64,
     p_tol: f64,
     max_scf: usize,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     use crate::pbc::ExtentConvention;
     let extent =
@@ -1388,6 +1549,8 @@ fn dielectric_with_extent(
         e_tol,
         p_tol,
         max_scf,
+        0.0,
+        allow_fractional_occupations,
     )?;
     let (alpha, epsilon) = py
         .allow_threads(|| crate::pbc::dielectric_tensor_with_extent(&mol, &params, &opts, extent))
@@ -1467,8 +1630,9 @@ fn dielectric_with_extent(
     numbers, positions, cell, pbc, q_points, kpts=(2, 2, 2), charge=0.0, multiplicity=1,
     method="am1", realspace_cutoff=40.0, exchange_cutoff=20.0, e_tol=1.0e-11, p_tol=1.0e-10,
     max_scf=500, long_range="auto",
-    cpscf_tol=1.0e-10, cpscf_max_iter=200, cpscf_mixing=0.7
+    cpscf_tol=1.0e-8, cpscf_max_iter=200, cpscf_mixing=0.7, smearing_ev=0.0, allow_fractional_occupations=false
 ))]
+#[allow(clippy::too_many_arguments)]
 fn dfpt(
     py: Python<'_>,
     numbers: Vec<u8>,
@@ -1489,6 +1653,8 @@ fn dfpt(
     cpscf_tol: f64,
     cpscf_max_iter: usize,
     cpscf_mixing: f64,
+    smearing_ev: f64,
+    allow_fractional_occupations: bool,
 ) -> PyResult<PyObject> {
     use crate::pbc::kpoints::KPoint;
     use crate::pbc::{DfptOptions, LongRange};
@@ -1506,6 +1672,8 @@ fn dfpt(
         e_tol,
         p_tol,
         max_scf,
+        smearing_ev,
+        allow_fractional_occupations,
     )?;
     let long_range = match long_range.trim().to_ascii_lowercase().as_str() {
         "auto" | "" => LongRange::Auto,
@@ -1634,6 +1802,10 @@ fn am1_bcc(
         .allow_threads(|| crate::bcc::am1_bcc_charges(&mol, &params, &opts))
         .map_err(to_py_err)?;
     let d = PyDict::new(py);
+    // The mol2 text, rendered by the crate rather than by the caller: the Python front end
+    // writes a `--mol2-output` file and it has to be byte-identical to the Rust one's. Built
+    // before the fields are moved out below.
+    d.set_item("mol2", crate::bcc::to_mol2(&mol, &bcc))?;
     d.set_item("charges", bcc.charges)?;
     d.set_item("mulliken", bcc.mulliken)?;
     d.set_item("atom_types", bcc.atom_types)?;
@@ -1643,7 +1815,7 @@ fn am1_bcc(
 
 /// Harmonic vibrational frequencies (cm⁻¹) at the given geometry.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None, cphf_max_iter=None, cphf_tol=None))]
 fn frequencies(
     py: Python<'_>,
     numbers: Vec<u8>,
@@ -1653,25 +1825,24 @@ fn frequencies(
     reference: &str,
     method: &str,
     electric_field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
+    cphf_tol: Option<f64>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = params_for(method)?;
-    let opts = molecular_options(charge, multiplicity, reference, electric_field)?;
+    let opts = molecular_options_with(
+        charge,
+        multiplicity,
+        reference,
+        electric_field,
+        cphf_max_iter,
+        cphf_tol,
+    )?;
     let vib = py
         .allow_threads(|| crate::hessian::vibrational_analysis(&mol, &params, &opts, 1.0e-3))
         .map_err(to_py_err)?;
     let d = PyDict::new(py);
-    d.set_item("frequencies_cm", vib.frequencies_cm)?;
-    d.set_item("eigenvalues", vib.eigenvalues)?;
-    d.set_item("modes", matrix_rows(&vib.modes))?;
-    d.set_item(
-        "cartesian_displacements",
-        matrix_rows(&vib.cartesian_displacements),
-    )?;
-    d.set_item(
-        "translation_rotation_overlap",
-        vib.translation_rotation_overlap,
-    )?;
+    set_mode_items(&d, &vib)?;
     Ok(d.into())
 }
 
@@ -1681,7 +1852,7 @@ fn frequencies(
 /// the native surface's convention — and, for convenience, the same matrix in eV/Å². Row/column
 /// index `3·i + k` is atom `i`, Cartesian axis `k` (x, y, z), matching the input atom order.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None, cphf_max_iter=None, cphf_tol=None))]
 fn hessian(
     py: Python<'_>,
     numbers: Vec<u8>,
@@ -1691,10 +1862,19 @@ fn hessian(
     reference: &str,
     method: &str,
     electric_field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
+    cphf_tol: Option<f64>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = params_for(method)?;
-    let opts = molecular_options(charge, multiplicity, reference, electric_field)?;
+    let opts = molecular_options_with(
+        charge,
+        multiplicity,
+        reference,
+        electric_field,
+        cphf_max_iter,
+        cphf_tol,
+    )?;
     // Fully analytic (CPHF) Hessian, returned by the core in eV/Bohr².
     let h = py
         .allow_threads(|| crate::hessian::analytic_hessian(&mol, &params, &opts, 1.0e-3))
@@ -1796,12 +1976,21 @@ fn orbitals(
 
 /// The wavefunction as a **Molden**-format string.
 ///
-/// Write it to a file and open it in a viewer. The caveat is in the file itself and in
-/// `docs/`: NDDO assumes an orthonormal AO basis, so the coefficients are in an implicitly
-/// orthogonalized basis while the Slater functions listed are the raw, non-orthogonal ones.
-/// Shapes, nodes and symmetry are faithful; bonding-region amplitudes are approximate.
+/// Write it to a file and open it in a viewer. `basis` selects the section: `"gto"` (the default)
+/// writes a fitted Gaussian expansion of the Slater functions, which is what every viewer reads;
+/// `"sto"` writes the Slater functions themselves, which is exact and which most viewers skip.
+/// `primitives` is the expansion length for `"gto"`.
+///
+/// `deorthogonalize` (default `True`) writes `S^{-1/2} C`, so the coefficients belong to the
+/// non-orthogonal functions the file declares rather than to NDDO's implicitly orthogonalized
+/// basis. Pass `False` for the raw NDDO coefficients, which is what 0.2.2 and most other NDDO
+/// codes emit.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None))]
+#[pyo3(signature = (
+    numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1",
+    electric_field=None, basis="gto", primitives=crate::gto::DEFAULT_NGAUSS, deorthogonalize=true
+))]
+#[allow(clippy::too_many_arguments)]
 fn molden(
     py: Python<'_>,
     numbers: Vec<u8>,
@@ -1811,15 +2000,194 @@ fn molden(
     reference: &str,
     method: &str,
     electric_field: Option<Vec<f64>>,
+    basis: &str,
+    primitives: usize,
+    deorthogonalize: bool,
 ) -> PyResult<String> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = params_for(method)?;
     let opts = molecular_options(charge, multiplicity, reference, electric_field)?;
+    let section = match basis.trim().to_ascii_lowercase().as_str() {
+        "gto" | "gaussian" => crate::molden::MoldenBasis::Gaussian(primitives),
+        "sto" | "slater" => crate::molden::MoldenBasis::Slater,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "invalid molden basis '{other}' (expected 'gto' or 'sto')"
+            )))
+        }
+    };
+    let molden_opts = crate::molden::MoldenOptions {
+        basis: section,
+        deorthogonalize,
+    };
     py.allow_threads(|| {
         let scf = run_am1(&mol, &params, &opts)?;
-        crate::molden::to_molden(&mol, &params, &scf)
+        crate::molden::to_molden_with(&mol, &params, &scf, &molden_opts)
     })
     .map_err(to_py_err)
+}
+
+/// **L-BFGS geometry optimization under periodic boundary conditions.**
+///
+/// The periodic counterpart of [`optimize`]: relaxes the atoms against the k-point forces and,
+/// with `relax_cell`, the lattice against the analytic stress. Returns the relaxed positions in
+/// Ångström **and the relaxed cell**, because with `relax_cell` the positions alone do not
+/// describe the structure.
+///
+/// `pressure` is a target in eV per Bohr^d (`d` = number of periodic directions) and is the
+/// pressure the enthalpy `E + PΩ` is minimized at; it does nothing without `relax_cell`.
+#[pyfunction]
+#[pyo3(signature = (
+    numbers, positions, cell, pbc, kpts=(1, 1, 1), charge=0.0, multiplicity=1,
+    unrestricted=false, method="am1", smearing_ev=0.0, realspace_cutoff=40.0,
+    exchange_cutoff=20.0, e_tol=1.0e-8, p_tol=1.0e-7, max_scf=300,
+    relax_cell=false, pressure=0.0, max_iter=200, gtol=1.0e-3, stress_tol=1.0e-5,
+    electric_field=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn pbc_optimize(
+    py: Python<'_>,
+    numbers: Vec<u8>,
+    positions: Vec<Vec<f64>>,
+    cell: Vec<Vec<f64>>,
+    pbc: Vec<bool>,
+    kpts: (usize, usize, usize),
+    charge: f64,
+    multiplicity: usize,
+    unrestricted: bool,
+    method: &str,
+    smearing_ev: f64,
+    realspace_cutoff: f64,
+    exchange_cutoff: f64,
+    e_tol: f64,
+    p_tol: f64,
+    max_scf: usize,
+    relax_cell: bool,
+    pressure: f64,
+    max_iter: usize,
+    gtol: f64,
+    stress_tol: f64,
+    // A relaxation under a field is a relaxation of a different Hamiltonian, so it belongs here
+    // alongside every other term of it. Absent through 0.2.2, which meant the Python CLI's
+    // periodic `optimize` silently ignored `--field` while the Rust one applied it.
+    electric_field: Option<Vec<f64>>,
+) -> PyResult<PyObject> {
+    use crate::pbc::optimizer::{optimize_periodic, PbcOptOptions};
+    use crate::pbc::PbcOptions;
+
+    let (mol, params, opts) = periodic_setup(
+        &numbers,
+        &positions,
+        &cell,
+        &pbc,
+        kpts,
+        charge,
+        multiplicity,
+        method,
+        realspace_cutoff,
+        exchange_cutoff,
+        e_tol,
+        p_tol,
+        max_scf,
+        0.0,
+        false,
+    )?;
+    // ield_from, not a second conversion: this module's one place where atomic units become
+    // the crate's eV per e*Bohr.
+    let field = field_from(electric_field)?;
+    let opts = PbcOptions {
+        unrestricted: unrestricted || multiplicity > 1,
+        smearing_ev,
+        electric_field: field,
+        // `periodic_setup` turns time-reversal folding **off**, because the response entry points
+        // it also serves must sample `k` and `−k` separately. A ground-state relaxation has no
+        // such constraint, folding is exact for a real Hamiltonian, and leaving it off here would
+        // make this entry point sample a different mesh from `run_pbc_scf`'s default — which is
+        // what the two CLI front ends disagreed about: 4 k-points against 3.
+        fold_time_reversal: true,
+        ..opts
+    };
+    let settings = PbcOptOptions {
+        max_iter,
+        gtol,
+        relax_cell,
+        pressure,
+        stress_tol,
+        ..PbcOptOptions::default()
+    };
+    let res = py
+        .allow_threads(|| optimize_periodic(&mol, &params, &opts, &settings))
+        .map_err(to_py_err)?;
+
+    let coords: Vec<[f64; 3]> = res
+        .molecule
+        .atoms
+        .iter()
+        .map(|a| {
+            let p = a.position * BOHR_TO_ANGSTROM;
+            [p.x, p.y, p.z]
+        })
+        .collect();
+    let relaxed = res
+        .molecule
+        .cell
+        .ok_or_else(|| PyValueError::new_err("a periodic optimization must return a cell"))?;
+    let cell_rows: Vec<[f64; 3]> = relaxed
+        .cell
+        .col
+        .iter()
+        .map(|v| {
+            let a = *v * BOHR_TO_ANGSTROM;
+            [a.x, a.y, a.z]
+        })
+        .collect();
+    let forces: Vec<[f64; 3]> = res
+        .gradient
+        .forces
+        .iter()
+        .map(|f| {
+            let v = *f * BOHR_TO_ANGSTROM.recip();
+            [v.x, v.y, v.z]
+        })
+        .collect();
+
+    let d = PyDict::new(py);
+    d.set_item("positions_angstrom", coords)?;
+    d.set_item("cell_angstrom", cell_rows)?;
+    d.set_item("pbc", relaxed.periodic.to_vec())?;
+    d.set_item("energy_ev", res.scf.total_ev)?;
+    d.set_item("energy_hartree", res.scf.total_ev * EV_TO_HARTREE)?;
+    d.set_item("electronic_ev", res.scf.electronic_ev)?;
+    d.set_item("core_ev", res.scf.core_ev)?;
+    d.set_item("free_energy_ev", res.scf.free_energy_ev())?;
+    d.set_item("forces_ev_per_angstrom", forces)?;
+    // eV/Å^d, matching `pbc_point` and ASE — see the note there. The crate's native eV/Bohr^d is
+    // beside it rather than instead of it, because the CLI needs one and ASE needs the other and
+    // converting in either front end is what put the two out of step.
+    let stress_scale = ANGSTROM_TO_BOHR.powi(relaxed.n_periodic() as i32);
+    d.set_item(
+        "stress_voigt",
+        res.gradient
+            .stress_voigt()
+            .iter()
+            .map(|v| v * stress_scale)
+            .collect::<Vec<f64>>(),
+    )?;
+    d.set_item("stress_voigt_ev_per_bohr", res.gradient.stress_voigt())?;
+    d.set_item("pressure", res.gradient.pressure(relaxed.n_periodic()))?;
+    d.set_item("charges", res.scf.charges.clone())?;
+    d.set_item("fermi_energy_ev", res.scf.fermi_energy_ev)?;
+    d.set_item("entropy_ev", res.scf.entropy_ev)?;
+    d.set_item("k_points", res.scf.k_points)?;
+    d.set_item("converged", res.converged)?;
+    d.set_item("iterations", res.iterations)?;
+    d.set_item("scf_iterations", res.scf.iterations)?;
+    d.set_item("unrestricted", res.scf.unrestricted)?;
+    d.set_item("max_image_overlap", res.scf.max_image_overlap)?;
+    d.set_item("charged_cell_warning", res.scf.charged_cell_warning.clone())?;
+    d.set_item("max_force_ev_per_bohr", res.gradient.max_gradient)?;
+    d.set_item("method", params.method.name())?;
+    Ok(d.into())
 }
 
 /// Infrared spectrum: the atomic polar tensor and the mode-resolved intensities.
@@ -1827,7 +2195,7 @@ fn molden(
 /// **Expensive** — it solves the CPHF equations, i.e. it costs an analytic Hessian. Called
 /// explicitly rather than folded into a single point for exactly that reason.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1", electric_field=None, cphf_max_iter=None, cphf_tol=None))]
 fn ir_spectrum(
     py: Python<'_>,
     numbers: Vec<u8>,
@@ -1837,10 +2205,19 @@ fn ir_spectrum(
     reference: &str,
     method: &str,
     electric_field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
+    cphf_tol: Option<f64>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = params_for(method)?;
-    let opts = molecular_options(charge, multiplicity, reference, electric_field)?;
+    let opts = molecular_options_with(
+        charge,
+        multiplicity,
+        reference,
+        electric_field,
+        cphf_max_iter,
+        cphf_tol,
+    )?;
     let s = py
         .allow_threads(|| crate::ir::ir_spectrum(&mol, &params, &opts))
         .map_err(to_py_err)?;
@@ -1859,6 +2236,11 @@ fn ir_spectrum(
     d.set_item(
         "translation_rotation_overlap",
         s.modes.translation_rotation_overlap.clone(),
+    )?;
+    d.set_item("rigid_body_count", s.modes.rigid_body_count)?;
+    d.set_item(
+        "rigid_body_frequencies_cm",
+        s.modes.rigid_body_frequencies_cm.clone(),
     )?;
     d.set_item("modes", matrix_rows(&s.modes.modes))?;
     let bands = s.vibrational_bands(0.5);
@@ -1974,7 +2356,7 @@ fn orbital_response(
 #[pyo3(signature = (
     numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="am1",
     electric_field=None, hessian=true, frequencies=true, ir=true,
-    orbital_response=false, response_density=false
+    orbital_response=false, response_density=false, cphf_max_iter=None, cphf_tol=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn vibrations(
@@ -1991,10 +2373,19 @@ fn vibrations(
     ir: bool,
     orbital_response: bool,
     response_density: bool,
+    cphf_max_iter: Option<usize>,
+    cphf_tol: Option<f64>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = params_for(method)?;
-    let opts = molecular_options(charge, multiplicity, reference, electric_field)?;
+    let opts = molecular_options_with(
+        charge,
+        multiplicity,
+        reference,
+        electric_field,
+        cphf_max_iter,
+        cphf_tol,
+    )?;
 
     // The one solve.
     let r = py
@@ -2097,6 +2488,19 @@ fn set_mode_items(d: &Bound<'_, PyDict>, vib: &crate::hessian::VibrationalModes)
         "translation_rotation_overlap",
         vib.translation_rotation_overlap.clone(),
     )?;
+    // Since 0.2.3 the rigid-body directions are projected out before the diagonalization, so
+    // `frequencies_cm` is `3N − rigid_body_count` long and holds vibrations only. These two say
+    // what was removed: the count (6, 5 for a linear molecule, 3 for an atom) and the curvature
+    // left in each removed direction, which is zero only at a stationary point.
+    d.set_item("rigid_body_count", vib.rigid_body_count)?;
+    d.set_item(
+        "rigid_body_frequencies_cm",
+        vib.rigid_body_frequencies_cm.clone(),
+    )?;
+    // The unprojected `3N` spectrum — what 0.2.2 returned — so the projection can be checked
+    // rather than taken on trust.
+    d.set_item("all_frequencies_cm", vib.all_frequencies_cm.clone())?;
+    d.set_item("all_eigenvalues", vib.all_eigenvalues.clone())?;
     Ok(())
 }
 
@@ -2140,6 +2544,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(single_point, m)?)?;
     m.add_function(wrap_pyfunction!(gradient, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;
+    m.add_function(wrap_pyfunction!(pbc_optimize, m)?)?;
     m.add_function(wrap_pyfunction!(frequencies, m)?)?;
     m.add_function(wrap_pyfunction!(hessian, m)?)?;
     m.add_function(wrap_pyfunction!(am1_bcc, m)?)?;

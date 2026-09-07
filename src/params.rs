@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! AM1 element parameters and the derived NDDO multipole quantities.
+//! AM1/RM1 element parameters and the derived NDDO multipole quantities.
 //!
-//! Parses the embedded MOPAC AM1 parameter table and, per element, precomputes the
-//! dipole/quadrupole charge separations `dd`/`qq` and the Klopman–Ohno additive terms
-//! `rho0/rho1/rho2` used by the two-center two-electron integrals. The closed forms and
+//! Parses the embedded parameter table for the selected [`NddoMethod`] and, per element,
+//! precomputes the dipole/quadrupole charge separations `dd`/`qq` and the Klopman–Ohno additive
+//! terms `rho0/rho1/rho2` used by the two-center two-electron integrals. The closed forms and
 //! the `rho1`/`rho2` secant solves follow MOPAC `calpar.f`/`ddpo.f` (verified against the
 //! PySEQM reference implementation).
+//!
+//! Both parameterizations run through this one path because they have the same functional form:
+//! AM1 (Dewar, Zoebisch, Healy & Stewart, *J. Am. Chem. Soc.* **107**, 3902 (1985)) and RM1
+//! (Rocha, Freire, Simas & Stewart, *J. Comput. Chem.* **27**, 1101 (2006)) differ only in the
+//! numbers. See [`crate::data_tables`] for where each table came from.
 
 use crate::constants::AM1_EV;
 use crate::data_tables::{self, AM1_PARAM_CSV, RM1_PARAM_CSV};

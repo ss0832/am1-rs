@@ -34,29 +34,65 @@ type HessianBlock = (usize, usize, [[f64; 3]; 3]);
 pub struct VibrationalModes {
     /// Cartesian Hessian (eV/Bohr²), symmetric, size `3N × 3N`.
     pub hessian: Matrix,
-    /// Harmonic frequencies (cm⁻¹), ascending; negative = imaginary (saddle/unconverged).
+    /// Harmonic **vibrational** frequencies (cm⁻¹), ascending; negative = imaginary
+    /// (saddle/unconverged).
+    ///
+    /// `3N − n_rigid` of them: the rigid-body directions are projected out before the
+    /// diagonalization rather than diagonalized and then recognized, so there is no
+    /// translation or rotation left in this list to identify. See [`Self::rigid_body_count`].
     pub frequencies_cm: Vec<f64>,
-    /// Mass-weighted eigenvalues (eV/(Å²·amu)).
+    /// Mass-weighted eigenvalues (eV/(Å²·amu)), one per entry of [`Self::frequencies_cm`].
     pub eigenvalues: Vec<f64>,
-    /// Mass-weighted normal-mode eigenvectors, `3N × 3N`, **columns** are modes and are
-    /// orthonormal (`LᵀL = I`). Column `k` matches `frequencies_cm[k]`.
+    /// Mass-weighted normal-mode eigenvectors, `3N × (3N − n_rigid)`, **columns** are modes and
+    /// are orthonormal (`LᵀL = I`). Column `k` matches `frequencies_cm[k]`.
     ///
     /// These, not the Cartesian displacements, are what `∂μ/∂Q_k = Σ_j (∂μ/∂R_j) L_{jk}/√m_j`
     /// needs; see [`crate::ir`]. They used to be discarded, which is why there was no way to get
     /// an infrared intensity out of a frequency calculation.
     pub modes: Matrix,
-    /// Cartesian displacements `M^{−1/2} L`, `3N × 3N`, columns are modes.
+    /// Cartesian displacements `M^{−1/2} L`, `3N × (3N − n_rigid)`, columns are modes.
     ///
     /// Deliberately **not** renormalized: the normalization lives on `modes`, and rescaling
     /// these would silently change what `∂μ/∂Q` means.
     pub cartesian_displacements: Matrix,
     /// For each mode, the fraction of its norm lying in the translation/rotation subspace, `0…1`.
     ///
-    /// A rigid-body mode scores ≈ 1 and a vibration ≈ 0. Reported rather than filtered by a
-    /// frequency threshold because "is this a vibration" is a question about the eigenvector, and
-    /// a linear molecule has five rigid-body modes where a bent one has six — data, not an
-    /// assumption about `3N − 6`.
+    /// After the projection this is zero to roundoff for every mode, and it is kept because that
+    /// is worth being able to *check* rather than assume. It is also the field that used to be
+    /// the only way to tell a vibration from a rigid-body mode.
     pub translation_rotation_overlap: Vec<f64>,
+    /// How many rigid-body directions were removed: 6 for a general molecule, 5 for a linear one,
+    /// 3 for a single atom, 0 for none.
+    ///
+    /// **Discovered, not assumed.** The count is the rank of the translation/rotation span (see
+    /// [`translation_rotation_basis`]), so a linear molecule yields 5 without anything having to
+    /// decide that it is linear.
+    pub rigid_body_count: usize,
+    /// The **unprojected** `3N` spectrum: every eigenvalue of the mass-weighted Hessian, in
+    /// cm⁻¹, ascending.
+    ///
+    /// This is what releases through 0.2.2 returned as `frequencies_cm`, and it is kept because
+    /// the projection is a claim that ought to be checkable: the rigid-body modes are *in* here,
+    /// wherever the arithmetic actually put them, and `tests/pbc_phonon.rs` uses it for the
+    /// supercell-folding identity — which is a statement about the full spectrum and cannot be
+    /// made against a projected one. It costs one extra diagonalization of a matrix the Hessian
+    /// already paid `O(N³)` CPHF iterations to build.
+    pub all_frequencies_cm: Vec<f64>,
+    /// The same unprojected spectrum before the square root: every eigenvalue of the mass-weighted
+    /// Hessian, in eV/(Å²·amu), ascending.
+    ///
+    /// Kept alongside [`Self::all_frequencies_cm`] because the square root is lossy at the bottom
+    /// of the spectrum — a rigid-body eigenvalue of `−1e−12` and one of `+1e−12` both come out as
+    /// roughly ∓0.03 cm⁻¹ — so a caller checking that its own diagonalization of
+    /// [`Self::hessian`] agrees with ours has to compare eigenvalues, not frequencies.
+    pub all_eigenvalues: Vec<f64>,
+    /// The curvature left in each removed direction, expressed as a frequency (cm⁻¹).
+    ///
+    /// `ω(⟨b|H'|b⟩)` for each rigid-body basis vector `b`. Translations give exactly zero by
+    /// translational invariance of the energy; rotations give zero only *at a stationary point*,
+    /// so a large value here means the geometry is not converged — the diagnostic that the old
+    /// "anything below 50 cm⁻¹ is a rotation" tag was standing in for, without the guesswork.
+    pub rigid_body_frequencies_cm: Vec<f64>,
 }
 
 /// Cartesian Hessian (eV/Bohr²) by central differences of the analytic gradient.
@@ -133,6 +169,9 @@ pub fn vibrational_analysis_from_hessian(
     let nat = molecule.atoms.len();
     let ndof = 3 * nat;
 
+    // Checked once, up front, rather than discovered as an `∞` inside the eigensolver.
+    crate::data_tables::require_masses(molecule)?;
+
     // Mass-weight: H'_ij = H_ij / sqrt(m_i m_j), converting eV/Bohr² → eV/Å².
     let a0_sq = crate::constants::ANGSTROM_TO_BOHR * crate::constants::ANGSTROM_TO_BOHR;
     let mass_of = |dof: usize| MASS[molecule.atoms[dof / 3].z as usize];
@@ -143,29 +182,66 @@ pub fn vibrational_analysis_from_hessian(
             mw[(i, j)] = hessian[(i, j)] * a0_sq / mij; // eV/(Å²·amu)
         }
     }
-    let (eigs, vecs) = symmetric_eigen(&mw)?;
-    let frequencies_cm: Vec<f64> = eigs
-        .iter()
-        .map(|&lam| {
-            if lam >= 0.0 {
-                SQRT_EV_PER_ANG2_AMU_TO_CM * lam.sqrt()
-            } else {
-                -SQRT_EV_PER_ANG2_AMU_TO_CM * (-lam).sqrt()
-            }
-        })
-        .collect();
+    // ---- Eckart projection ----
+    //
+    // The rigid-body directions are *removed from the problem* rather than diagonalized along
+    // with everything else and recognized afterwards. Through 0.2.2 the whole `3N × 3N`
+    // mass-weighted Hessian was diagonalized and the six near-zero eigenvalues were left in the
+    // output, to be identified downstream by "|ν| < 50 cm⁻¹". That rule is wrong in both
+    // directions: a soft torsion below 50 cm⁻¹ is a real vibration and gets tagged as a
+    // rotation, and away from a stationary point a rotation carries real curvature and comes out
+    // well above 50. It also leaves the *vibrations* contaminated, because at a non-stationary
+    // geometry the rotational block does not merely sit at zero — it mixes.
+    //
+    // Diagonalizing `Qᵀ H' Q` on an orthonormal basis `Q` of the complement is what makes the
+    // count exact and the contamination gone: every eigenvalue that comes back is a vibration by
+    // construction, and there is nothing left to threshold.
+    let tr_basis = translation_rotation_basis(molecule);
+    let rigid_body_count = tr_basis.len();
+    let complement = orthogonal_complement(&tr_basis, ndof);
+    let nvib = complement.len();
+
+    let mut projected = Matrix::zeros(nvib, nvib);
+    for a in 0..nvib {
+        // `H' q_b` once per column, reused across the rows above it.
+        let mut hq = vec![0.0; ndof];
+        for i in 0..ndof {
+            hq[i] = (0..ndof).map(|j| mw[(i, j)] * complement[a][j]).sum();
+        }
+        for b in a..nvib {
+            let v: f64 = (0..ndof).map(|i| complement[b][i] * hq[i]).sum();
+            projected[(a, b)] = v;
+            projected[(b, a)] = v;
+        }
+    }
+    let (eigs, small) = symmetric_eigen(&projected)?;
+    let to_cm = |lam: f64| {
+        if lam >= 0.0 {
+            SQRT_EV_PER_ANG2_AMU_TO_CM * lam.sqrt()
+        } else {
+            -SQRT_EV_PER_ANG2_AMU_TO_CM * (-lam).sqrt()
+        }
+    };
+    let frequencies_cm: Vec<f64> = eigs.iter().map(|&lam| to_cm(lam)).collect();
+
+    // Lift the eigenvectors back into the full `3N` space: `L = Q y`.
+    let mut vecs = Matrix::zeros(ndof, nvib);
+    for k in 0..nvib {
+        for i in 0..ndof {
+            vecs[(i, k)] = (0..nvib).map(|a| complement[a][i] * small[(a, k)]).sum();
+        }
+    }
 
     // Cartesian displacements `M^{−1/2} L`, column by column.
-    let mut cartesian = Matrix::zeros(ndof, ndof);
+    let mut cartesian = Matrix::zeros(ndof, nvib);
     for i in 0..ndof {
         let inv_sqrt_m = 1.0 / mass_of(i).sqrt();
-        for k in 0..ndof {
+        for k in 0..nvib {
             cartesian[(i, k)] = vecs[(i, k)] * inv_sqrt_m;
         }
     }
 
-    let tr_basis = translation_rotation_basis(molecule);
-    let translation_rotation_overlap = (0..ndof)
+    let translation_rotation_overlap = (0..nvib)
         .map(|k| {
             tr_basis
                 .iter()
@@ -178,14 +254,78 @@ pub fn vibrational_analysis_from_hessian(
         })
         .collect();
 
+    // What the projection threw away, reported rather than discarded silently.
+    let rigid_body_frequencies_cm = tr_basis
+        .iter()
+        .map(|b| {
+            let mut acc = 0.0;
+            for i in 0..ndof {
+                let bi = b[i];
+                if bi == 0.0 {
+                    continue;
+                }
+                for j in 0..ndof {
+                    acc += bi * mw[(i, j)] * b[j];
+                }
+            }
+            to_cm(acc)
+        })
+        .collect();
+
+    // The unprojected spectrum, for the record. Computed after the projected one so that a
+    // failure here cannot silently change what `frequencies_cm` holds.
+    let (all_eigs, _) = symmetric_eigen(&mw)?;
+    let all_frequencies_cm: Vec<f64> = all_eigs.iter().map(|&lam| to_cm(lam)).collect();
+
     Ok(VibrationalModes {
         hessian,
         frequencies_cm,
+        all_frequencies_cm,
+        all_eigenvalues: all_eigs,
         eigenvalues: eigs,
         modes: vecs,
         cartesian_displacements: cartesian,
         translation_rotation_overlap,
+        rigid_body_count,
+        rigid_body_frequencies_cm,
     })
+}
+
+/// An orthonormal basis of the orthogonal complement of `span(basis)` in `R^ndof`.
+///
+/// Modified Gram–Schmidt over the Cartesian unit vectors, run **twice** against everything
+/// already accepted. Once is not enough for the same reason it was not enough in
+/// `pbc::complex::hermitian_eigen`: a unit vector that lies almost entirely inside the span
+/// leaves a residual dominated by cancellation, and a single pass then normalizes noise up to
+/// unit length and admits it as a direction. Two passes leave `O(ε)` for a genuine duplicate and
+/// `O(1)` for a genuine new direction, which is why the `0.1` cut below can sit between them
+/// instead of being tuned.
+fn orthogonal_complement(basis: &[Vec<f64>], ndof: usize) -> Vec<Vec<f64>> {
+    let wanted = ndof - basis.len();
+    let mut out: Vec<Vec<f64>> = Vec::with_capacity(wanted);
+    for seed in 0..ndof {
+        if out.len() == wanted {
+            break;
+        }
+        let mut v = vec![0.0; ndof];
+        v[seed] = 1.0;
+        for _ in 0..2 {
+            for b in basis.iter().chain(out.iter()) {
+                let dot: f64 = v.iter().zip(b).map(|(x, y)| x * y).sum();
+                for (x, y) in v.iter_mut().zip(b) {
+                    *x -= dot * y;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.1 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// An orthonormal basis for the rigid-body subspace, in **mass-weighted** coordinates.
@@ -194,7 +334,22 @@ pub fn vibrational_analysis_from_hessian(
 /// by modified Gram–Schmidt with near-null vectors dropped. A linear molecule yields five vectors
 /// and an atom three, because the rotation about the molecular axis (or any rotation of a single
 /// atom) has zero norm and falls out — which is why the count is discovered rather than assumed.
+///
+/// # Under a cell there are no rotations
+///
+/// A rigid rotation is a symmetry of an isolated molecule and **not** of a periodic structure:
+/// rotating the contents of a cell without rotating the lattice changes the energy, so the
+/// rotational directions carry real curvature and are ordinary vibrations of the supercell. Only
+/// the three translations survive. Projecting rotations out of a periodic Hessian would delete
+/// two or three genuine modes — `tests/pbc_phonon.rs` catches it as a mode-count mismatch against
+/// the union of `D(q)` over the commensurate `q`, which is the identity that pins this down.
 fn translation_rotation_basis(molecule: &Molecule) -> Vec<Vec<f64>> {
+    let periodic = molecule.cell.map(|c| c.n_periodic() > 0).unwrap_or(false);
+    translation_rotation_basis_with(molecule, !periodic)
+}
+
+/// [`translation_rotation_basis`] with the rotational block explicitly switched on or off.
+fn translation_rotation_basis_with(molecule: &Molecule, rotations: bool) -> Vec<Vec<f64>> {
     let nat = molecule.atoms.len();
     let ndof = 3 * nat;
     let mass = |a: usize| MASS[molecule.atoms[a].z as usize];
@@ -216,20 +371,22 @@ fn translation_rotation_basis(molecule: &Molecule) -> Vec<Vec<f64>> {
         }
         raw.push(v);
     }
-    for axis in 0..3 {
-        let e = match axis {
-            0 => Vec3::new(1.0, 0.0, 0.0),
-            1 => Vec3::new(0.0, 1.0, 0.0),
-            _ => Vec3::new(0.0, 0.0, 1.0),
-        };
-        let mut v = vec![0.0; ndof];
-        for a in 0..nat {
-            let d = e.cross(molecule.atoms[a].position - com) * mass(a).sqrt();
-            v[3 * a] = d.x;
-            v[3 * a + 1] = d.y;
-            v[3 * a + 2] = d.z;
+    if rotations {
+        for axis in 0..3 {
+            let e = match axis {
+                0 => Vec3::new(1.0, 0.0, 0.0),
+                1 => Vec3::new(0.0, 1.0, 0.0),
+                _ => Vec3::new(0.0, 0.0, 1.0),
+            };
+            let mut v = vec![0.0; ndof];
+            for a in 0..nat {
+                let d = e.cross(molecule.atoms[a].position - com) * mass(a).sqrt();
+                v[3 * a] = d.x;
+                v[3 * a + 1] = d.y;
+                v[3 * a + 2] = d.z;
+            }
+            raw.push(v);
         }
-        raw.push(v);
     }
 
     let mut basis: Vec<Vec<f64>> = Vec::with_capacity(6);
@@ -593,6 +750,8 @@ pub fn analytic_hessian_with_response(
             params,
             basis: &basis,
             core: &core,
+            max_iter: options.cphf_max_iter,
+            tol: options.cphf_tol,
         };
         let solved: Vec<(Matrix, CphfOutcome)> = {
             let _t = crate::timing::Timer::start("hess:cphf");
@@ -602,7 +761,7 @@ pub fn analytic_hessian_with_response(
                 .collect::<Result<Vec<_>>>()?
         };
         let (uov, outcomes): (Vec<Matrix>, Vec<CphfOutcome>) = solved.into_iter().unzip();
-        check_cphf(&outcomes)?;
+        check_cphf(&outcomes, options.cphf_max_iter)?;
 
         // Assemble H_relax[a][b] = 4 G^a : U^b.
         //
@@ -1016,10 +1175,6 @@ fn cphf_debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("AM1_CPHF_DEBUG").is_some())
 }
 
-/// Maximum CPHF fixed-point iterations per nuclear perturbation.
-const CPHF_MAX_ITER: usize = 100;
-/// Convergence threshold on the CPHF fixed-point residual `‖U_{n+1} − U_n‖₂`.
-const CPHF_TOL: f64 = 1.0e-9;
 /// DIIS subspace size for the CPHF solve.
 const CPHF_DIIS_DEPTH: usize = 8;
 
@@ -1031,6 +1186,26 @@ pub struct CphfOutcome {
     pub iterations: usize,
     pub residual: f64,
     pub converged: bool,
+    /// False when conjugate gradient found a **non-positive curvature** along a search direction
+    /// and handed the solve to the fixed-point fallback.
+    ///
+    /// The orbital Hessian is positive definite at a stable SCF solution and only there, so this
+    /// is a statement about the wavefunction rather than about the solver: the SCF converged to a
+    /// saddle point in orbital space. It is carried out of the solver because it changes what a
+    /// failure *means* — "iterate harder" is the wrong advice for an unstable reference, and it
+    /// is the advice the error used to give.
+    pub positive_definite: bool,
+}
+
+impl Default for CphfOutcome {
+    fn default() -> Self {
+        Self {
+            iterations: 0,
+            residual: f64::INFINITY,
+            converged: false,
+            positive_definite: true,
+        }
+    }
 }
 
 /// Pulay DIIS coefficients for the CPHF fixed-point residuals.
@@ -1209,6 +1384,9 @@ struct CphfContext<'a> {
     params: &'a Am1Parameters,
     basis: &'a crate::basis::Basis,
     core: &'a crate::hamiltonian::CoreHamiltonian,
+    /// Iteration cap and residual threshold for this solve, from [`crate::Am1Options`].
+    max_iter: usize,
+    tol: f64,
 }
 
 fn apply_orbital_hessian(ctx: &CphfContext<'_>, u: &Matrix, neg_denom: &Matrix) -> Result<Matrix> {
@@ -1302,13 +1480,14 @@ fn cphf_ov(ctx: &CphfContext<'_>, g_ov: &Matrix, denom: &Matrix) -> Result<(Matr
         iterations: 1,
         residual: z.frobenius_dot(&z).sqrt(),
         converged: false,
+        positive_definite: true,
     };
-    if outcome.residual < CPHF_TOL {
+    if outcome.residual < ctx.tol {
         outcome.converged = true;
         return Ok((u, outcome));
     }
 
-    for iter in 2..=CPHF_MAX_ITER {
+    for iter in 2..=ctx.max_iter {
         let bp = apply_orbital_hessian(ctx, &p, &neg_denom)?;
         let pbp = p.frobenius_dot(&bp);
         // Negated `>` rather than `<=`: a NaN curvature is exactly the case that must fall back,
@@ -1317,8 +1496,12 @@ fn cphf_ov(ctx: &CphfContext<'_>, g_ov: &Matrix, denom: &Matrix) -> Result<(Matr
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(pbp > 0.0) {
             // Not positive definite along this direction. Rather than press on with a step that
-            // has no variational meaning, hand the problem to the fixed-point solver.
-            return cphf_ov_fixed_point(ctx, g_ov, denom);
+            // has no variational meaning, hand the problem to the fixed-point solver — and record
+            // *why*, because "the SCF is at a saddle point" and "the solve needs more iterations"
+            // call for different things from the caller.
+            let (u, mut fallback) = cphf_ov_fixed_point(ctx, g_ov, denom)?;
+            fallback.positive_definite = false;
+            return Ok((u, fallback));
         }
         let alpha = rz / pbp;
         axpy(&mut u, alpha, &p);
@@ -1331,7 +1514,8 @@ fn cphf_ov(ctx: &CphfContext<'_>, g_ov: &Matrix, denom: &Matrix) -> Result<(Matr
         outcome = CphfOutcome {
             iterations: iter,
             residual,
-            converged: residual < CPHF_TOL,
+            converged: residual < ctx.tol,
+            ..outcome
         };
         if outcome.converged {
             break;
@@ -1365,13 +1549,9 @@ fn cphf_ov_fixed_point(
     let mut u = elem_div(g_ov);
     let mut trials: Vec<Matrix> = Vec::with_capacity(CPHF_DIIS_DEPTH);
     let mut errors: Vec<Matrix> = Vec::with_capacity(CPHF_DIIS_DEPTH);
-    let mut outcome = CphfOutcome {
-        iterations: 0,
-        residual: f64::INFINITY,
-        converged: false,
-    };
+    let mut outcome = CphfOutcome::default();
 
-    for iter in 1..=CPHF_MAX_ITER {
+    for iter in 1..=ctx.max_iter {
         // Three phases, timed separately because which one dominates is not obvious and the
         // answer decides where optimization effort goes. The Fock build looks like the expensive
         // one; the two MO<->AO transforms around it are `nao² × n_occ` matmuls and are not.
@@ -1414,7 +1594,8 @@ fn cphf_ov_fixed_point(
         outcome = CphfOutcome {
             iterations: iter,
             residual,
-            converged: residual < CPHF_TOL,
+            converged: residual < ctx.tol,
+            ..outcome
         };
         if outcome.converged {
             u = u_new;
@@ -1444,7 +1625,7 @@ fn cphf_ov_fixed_point(
 }
 
 /// Fail if any perturbation's CPHF solve hit the iteration limit.
-fn check_cphf(outcomes: &[CphfOutcome]) -> Result<()> {
+fn check_cphf(outcomes: &[CphfOutcome], max_iter: usize) -> Result<()> {
     let failed = outcomes.iter().filter(|o| !o.converged).count();
     if failed == 0 {
         return Ok(());
@@ -1454,10 +1635,17 @@ fn check_cphf(outcomes: &[CphfOutcome]) -> Result<()> {
         .filter(|o| !o.converged)
         .map(|o| o.residual)
         .fold(0.0_f64, f64::max);
+    // A failure with non-positive curvature is a different diagnosis, and the difference matters
+    // to whoever reads it: an unstable SCF solution cannot be fixed by iterating harder or by
+    // loosening a tolerance, and the response it would produce has no variational meaning.
+    let unstable = outcomes
+        .iter()
+        .any(|o| !o.converged && !o.positive_definite);
     Err(crate::error::Am1Error::CphfNotConverged {
         perturbations: failed,
-        iterations: CPHF_MAX_ITER,
+        iterations: max_iter,
         residual,
+        unstable,
     })
 }
 
@@ -1703,6 +1891,8 @@ fn analytic_hessian_uhf(
                             params,
                             basis: &basis,
                             core: &core,
+                            max_iter: options.cphf_max_iter,
+                            tol: options.cphf_tol,
                         },
                         &gova[t],
                         &govb[t],
@@ -1713,7 +1903,7 @@ fn analytic_hessian_uhf(
                 .collect::<Result<Vec<_>>>()?
         };
         let outcomes: Vec<CphfOutcome> = solved.iter().map(|s| s.2).collect();
-        check_cphf(&outcomes)?;
+        check_cphf(&outcomes, options.cphf_max_iter)?;
         let uovs: Vec<(Matrix, Matrix)> = solved.into_iter().map(|(a, b, _)| (a, b)).collect();
 
         use rayon::prelude::*;
@@ -1958,9 +2148,195 @@ struct UcphfContext<'a> {
     params: &'a Am1Parameters,
     basis: &'a crate::basis::Basis,
     core: &'a crate::hamiltonian::CoreHamiltonian,
+    /// Iteration cap and residual threshold for this solve, from [`crate::Am1Options`].
+    max_iter: usize,
+    tol: f64,
 }
 
+/// Apply the **coupled** orbital Hessian to a `(U_α, U_β)` pair.
+///
+/// `B(u)_σ = (ε_a − ε_i)_σ ∘ u_σ + [G_σ(ΔP_α + ΔP_β, ΔP_σ)]_ov`, the same operator the
+/// fixed-point iteration below inverts by repeated substitution. The two channels couple through
+/// the Coulomb term, which sees the *total* response density, so neither can be solved alone.
+///
+/// One call is two Fock builds, which is what the whole solve costs; the figure of merit for a
+/// solver here is how many times it calls this.
+fn apply_ucphf_operator(
+    ctx: &UcphfContext<'_>,
+    ua: &Matrix,
+    ub: &Matrix,
+    neg_a: &Matrix,
+    neg_b: &Matrix,
+) -> Result<(Matrix, Matrix)> {
+    let (cva, coa) = (ctx.alpha.cv, ctx.alpha.co);
+    let (cvb, cob) = (ctx.beta.cv, ctx.beta.co);
+    let dpa = ao_response_density_w(ua, cva, coa, 1.0);
+    let dpb = ao_response_density_w(ub, cvb, cob, 1.0);
+    let mut dpt = dpa.clone();
+    for (t, x) in dpt.as_mut_slice().iter_mut().zip(dpb.as_slice()) {
+        *t += *x;
+    }
+    let mut fa =
+        crate::fock::build_fock_spin(ctx.molecule, ctx.basis, ctx.params, ctx.core, &dpt, &dpa)?;
+    let mut fb =
+        crate::fock::build_fock_spin(ctx.molecule, ctx.basis, ctx.params, ctx.core, &dpt, &dpb)?;
+    for (xv, hv) in fa.as_mut_slice().iter_mut().zip(ctx.core.h_core.as_slice()) {
+        *xv -= *hv;
+    }
+    for (xv, hv) in fb.as_mut_slice().iter_mut().zip(ctx.core.h_core.as_slice()) {
+        *xv -= *hv;
+    }
+    let mut out_a = project_ov(&fa, cva, coa);
+    let mut out_b = project_ov(&fb, cvb, cob);
+    for (ov, (uv, dv)) in out_a
+        .as_mut_slice()
+        .iter_mut()
+        .zip(ua.as_slice().iter().zip(neg_a.as_slice()))
+    {
+        *ov += dv * uv;
+    }
+    for (ov, (uv, dv)) in out_b
+        .as_mut_slice()
+        .iter_mut()
+        .zip(ub.as_slice().iter().zip(neg_b.as_slice()))
+    {
+        *ov += dv * uv;
+    }
+    Ok((out_a, out_b))
+}
+
+/// Solve the **coupled** UHF CPHF equations by preconditioned conjugate gradient.
+///
+/// # Why this exists
+///
+/// The restricted path got a conjugate-gradient solver in 0.2.1; this one was left on the
+/// DIIS-accelerated fixed-point iteration, and that iteration does not always converge. Measured
+/// on the methyl radical with the RM1 parameterization — four atoms, seven AOs, about as small as
+/// an open-shell system gets — the residual falls to `2e-8` and then **oscillates** between
+/// `2e-8` and `6e-7` for the rest of the iteration limit. It is a limit cycle, not slow
+/// convergence, so raising `Am1Options::cphf_max_iter` does nothing. The effect was that
+/// `am1-rs frequencies --method rm1 --uhf` and `am1-rs ir --method rm1 --uhf` failed outright;
+/// `tests/test_cli_matrix.py` is what found it.
+///
+/// Conjugate gradient does not have that failure mode: the coupled orbital Hessian is symmetric
+/// in the combined `(α, β)` space — it is the second derivative of one energy with respect to
+/// orbital rotations — and positive definite at a stable SCF solution, and CG on a symmetric
+/// positive-definite operator terminates. The convergence test is the same preconditioned
+/// residual `‖M⁻¹r‖` the fixed point measured as its step, so the tolerance did not move.
+///
+/// If the curvature along a search direction is not positive — an unstable UHF solution, which
+/// this code cannot rule out — it falls back to the fixed-point iteration rather than taking a
+/// step with no variational meaning.
 fn ucphf_ov(
+    ctx: &UcphfContext<'_>,
+    ga: &Matrix,
+    gb: &Matrix,
+    denom_a: &Matrix,
+    denom_b: &Matrix,
+) -> Result<(Matrix, Matrix, CphfOutcome)> {
+    let negate = |d: &Matrix| -> Matrix {
+        let mut n = d.clone();
+        for v in n.as_mut_slice() {
+            *v = -*v;
+        }
+        n
+    };
+    let (neg_a, neg_b) = (negate(denom_a), negate(denom_b));
+    // M⁻¹: divide by (ε_a − ε_i), with the near-degenerate guard the fixed point uses.
+    let precondition = |x: &Matrix, d: &Matrix| -> Matrix {
+        let mut z = x.clone();
+        for (zv, dv) in z.as_mut_slice().iter_mut().zip(d.as_slice()) {
+            *zv = if dv.abs() < 1.0e-10 { 0.0 } else { *zv / *dv };
+        }
+        z
+    };
+    let axpy = |y: &mut Matrix, a: f64, x: &Matrix| {
+        for (yv, xv) in y.as_mut_slice().iter_mut().zip(x.as_slice()) {
+            *yv += a * xv;
+        }
+    };
+    // The inner product runs over both channels: they are one vector, not two problems.
+    let dot = |xa: &Matrix, xb: &Matrix, ya: &Matrix, yb: &Matrix| -> f64 {
+        xa.frobenius_dot(ya) + xb.frobenius_dot(yb)
+    };
+
+    let (mut ba, mut bb) = (ga.clone(), gb.clone());
+    for v in ba.as_mut_slice() {
+        *v = -*v;
+    }
+    for v in bb.as_mut_slice() {
+        *v = -*v;
+    }
+
+    // Start from the uncoupled solution, which is where the fixed point also starts.
+    let mut ua = precondition(&ba, &neg_a);
+    let mut ub = precondition(&bb, &neg_b);
+    let (mut ra, mut rb) = (ba.clone(), bb.clone());
+    let (bua, bub) = apply_ucphf_operator(ctx, &ua, &ub, &neg_a, &neg_b)?;
+    axpy(&mut ra, -1.0, &bua);
+    axpy(&mut rb, -1.0, &bub);
+    let mut za = precondition(&ra, &neg_a);
+    let mut zb = precondition(&rb, &neg_b);
+    let (mut pa, mut pb) = (za.clone(), zb.clone());
+    let mut rz = dot(&ra, &rb, &za, &zb);
+    let mut outcome = CphfOutcome {
+        iterations: 1,
+        residual: dot(&za, &zb, &za, &zb).sqrt(),
+        converged: false,
+        positive_definite: true,
+    };
+    if outcome.residual < ctx.tol {
+        outcome.converged = true;
+        return Ok((ua, ub, outcome));
+    }
+
+    for iter in 2..=ctx.max_iter {
+        let (bpa, bpb) = apply_ucphf_operator(ctx, &pa, &pb, &neg_a, &neg_b)?;
+        let pbp = dot(&pa, &pb, &bpa, &bpb);
+        // Negated `>` rather than `<=`: a NaN curvature is exactly the case that must fall back,
+        // and `NaN <= 0.0` is false.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(pbp > 0.0) {
+            let (ua, ub, mut fallback) = ucphf_ov_fixed_point(ctx, ga, gb, denom_a, denom_b)?;
+            fallback.positive_definite = false;
+            return Ok((ua, ub, fallback));
+        }
+        let alpha = rz / pbp;
+        axpy(&mut ua, alpha, &pa);
+        axpy(&mut ub, alpha, &pb);
+        axpy(&mut ra, -alpha, &bpa);
+        axpy(&mut rb, -alpha, &bpb);
+        za = precondition(&ra, &neg_a);
+        zb = precondition(&rb, &neg_b);
+        let residual = dot(&za, &zb, &za, &zb).sqrt();
+        if cphf_debug() {
+            eprintln!("      ucphf cg iter {iter:3}  residual {residual:.6e}");
+        }
+        outcome = CphfOutcome {
+            iterations: iter,
+            residual,
+            converged: residual < ctx.tol,
+            ..outcome
+        };
+        if outcome.converged {
+            break;
+        }
+        let rz_new = dot(&ra, &rb, &za, &zb);
+        let beta = rz_new / rz;
+        rz = rz_new;
+        for (pv, zv) in pa.as_mut_slice().iter_mut().zip(za.as_slice()) {
+            *pv = *zv + beta * *pv;
+        }
+        for (pv, zv) in pb.as_mut_slice().iter_mut().zip(zb.as_slice()) {
+            *pv = *zv + beta * *pv;
+        }
+    }
+    Ok((ua, ub, outcome))
+}
+
+/// The DIIS-accelerated fixed-point iteration, kept as the fallback for a non-positive-definite
+/// orbital Hessian. See [`ucphf_ov`] for why it is no longer the primary solver.
+fn ucphf_ov_fixed_point(
     ctx: &UcphfContext<'_>,
     ga: &Matrix,
     gb: &Matrix,
@@ -1983,12 +2359,8 @@ fn ucphf_ov(
     let mut trials_b: Vec<Matrix> = Vec::with_capacity(CPHF_DIIS_DEPTH);
     let mut errors_a: Vec<Matrix> = Vec::with_capacity(CPHF_DIIS_DEPTH);
     let mut errors_b: Vec<Matrix> = Vec::with_capacity(CPHF_DIIS_DEPTH);
-    let mut outcome = CphfOutcome {
-        iterations: 0,
-        residual: f64::INFINITY,
-        converged: false,
-    };
-    for iter in 1..=CPHF_MAX_ITER {
+    let mut outcome = CphfOutcome::default();
+    for iter in 1..=ctx.max_iter {
         let dpa = ao_response_density_w(&ua, cva, coa, 1.0);
         let dpb = ao_response_density_w(&ub, cvb, cob, 1.0);
         let mut dpt = dpa.clone();
@@ -2026,10 +2398,16 @@ fn ucphf_ov(
             *ev -= *ov;
         }
         let residual = (err_a.frobenius_dot(&err_a) + err_b.frobenius_dot(&err_b)).sqrt();
+        // The RHF solver has traced its residual since 0.2.1 and this one did not, which is why
+        // "the UHF CPHF stalled" could only ever be reported as a final number.
+        if cphf_debug() {
+            eprintln!("      ucphf iter {iter:3}  residual {residual:.6e}");
+        }
         outcome = CphfOutcome {
             iterations: iter,
             residual,
-            converged: residual < CPHF_TOL,
+            converged: residual < ctx.tol,
+            ..outcome
         };
         if outcome.converged {
             ua = ua_new;
@@ -2158,8 +2536,9 @@ mod tests {
 
     #[test]
     fn water_vibrations() {
-        // Optimize water, then compute harmonic frequencies. Expect 3 real modes
-        // (bend ~1600–1800, two stretches ~3700–3900 cm⁻¹ for AM1) plus ~6 near-zero.
+        // Optimize water, then compute harmonic frequencies. `3N − 6 = 3` modes come back —
+        // bend plus two stretches — and *only* those: the rigid-body six are projected out
+        // rather than returned near zero to be recognized later.
         let mol = Molecule::from_xyz_str(
             "3\nwater\nO 0.0 0.0 0.0\nH 0.96 0.0 0.0\nH -0.24 0.93 0.0\n",
             0.0,
@@ -2171,19 +2550,138 @@ mod tests {
         let vib = vibrational_analysis(&relaxed.molecule, &params, &opts, 1.0e-3).unwrap();
         let freqs = &vib.frequencies_cm;
         eprintln!(
-            "H2O frequencies (cm^-1): {:?}",
-            freqs.iter().map(|f| f.round()).collect::<Vec<_>>()
+            "H2O frequencies (cm^-1): {:?}  rigid-body residual: {:?}",
+            freqs.iter().map(|f| f.round()).collect::<Vec<_>>(),
+            vib.rigid_body_frequencies_cm
+                .iter()
+                .map(|f| f.round())
+                .collect::<Vec<_>>()
         );
-        // The three highest are the real vibrational modes.
-        let n = freqs.len();
-        let high = &freqs[n - 3..];
-        assert!(high[0] > 1200.0 && high[0] < 2200.0, "bend {}", high[0]);
-        assert!(high[1] > 3000.0 && high[2] > 3000.0, "stretches {high:?}");
-        // The six lowest (trans/rot) should be small in magnitude.
-        let six_low_max = freqs[..6].iter().map(|f| f.abs()).fold(0.0_f64, f64::max);
+        assert_eq!(vib.rigid_body_count, 6, "a bent triatomic is not linear");
+        assert_eq!(freqs.len(), 3, "3N - 6 modes, not 3N");
+        assert!(freqs[0] > 1200.0 && freqs[0] < 2200.0, "bend {}", freqs[0]);
         assert!(
-            six_low_max < 300.0,
-            "trans/rot not near zero: {six_low_max}"
+            freqs[1] > 3000.0 && freqs[2] > 3000.0,
+            "stretches {freqs:?}"
         );
+        // Nothing rigid-body survives into the mode list; measured, not assumed.
+        let worst = vib
+            .translation_rotation_overlap
+            .iter()
+            .fold(0.0_f64, |m, o| m.max(*o));
+        assert!(
+            worst < 1.0e-16,
+            "a mode still carries rigid-body character: {worst}"
+        );
+        // At a converged geometry the removed directions carry no curvature either.
+        let residual = vib
+            .rigid_body_frequencies_cm
+            .iter()
+            .fold(0.0_f64, |m, f| m.max(f.abs()));
+        assert!(residual < 30.0, "rigid-body residual {residual} cm^-1");
+    }
+
+    /// A linear molecule has **five** rigid-body directions, so it has `3N − 5` vibrations. The
+    /// count is discovered from the rank of the rigid-body span, not from a test for linearity,
+    /// and this is what checks that.
+    #[test]
+    fn a_linear_molecule_keeps_one_more_vibration() {
+        let mol = Molecule::from_xyz_str(
+            "3\ncarbon dioxide\nO 0.0 0.0 -1.18\nC 0.0 0.0 0.0\nO 0.0 0.0 1.18\n",
+            0.0,
+        )
+        .unwrap();
+        let params = Am1Parameters::standard().unwrap();
+        let opts = Am1Options::default();
+        let relaxed = optimize(&mol, &params, &opts, &OptOptions::default()).unwrap();
+        let vib = vibrational_analysis(&relaxed.molecule, &params, &opts, 1.0e-3).unwrap();
+        eprintln!(
+            "CO2: {} rigid-body directions, frequencies {:?}",
+            vib.rigid_body_count,
+            vib.frequencies_cm
+                .iter()
+                .map(|f| f.round())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(vib.rigid_body_count, 5);
+        assert_eq!(vib.frequencies_cm.len(), 4, "3N - 5 for a linear molecule");
+        // The two bends are degenerate, so the lowest pair must agree.
+        assert!(
+            (vib.frequencies_cm[0] - vib.frequencies_cm[1]).abs() < 1.0,
+            "the degenerate bend split: {:?}",
+            vib.frequencies_cm
+        );
+    }
+
+    /// **The projection is not cosmetic.** At a geometry that is *not* a stationary point the
+    /// rotational block carries real curvature, mixes into the vibrations, and moves them. This
+    /// measures the difference against the unprojected spectrum the 0.2.2 code returned, so the
+    /// change is demonstrated rather than asserted.
+    #[test]
+    fn projection_changes_the_vibrations_away_from_a_stationary_point() {
+        let mol = Molecule::from_xyz_str(
+            "3\nstretched water\nO 0.0 0.0 0.0\nH 1.30 0.0 0.0\nH -0.32 1.24 0.0\n",
+            0.0,
+        )
+        .unwrap();
+        let params = Am1Parameters::standard().unwrap();
+        let opts = Am1Options::default();
+        let hessian = analytic_hessian(&mol, &params, &opts, 1.0e-3).unwrap();
+        let vib = vibrational_analysis_from_hessian(&mol, hessian.clone()).unwrap();
+
+        // The 0.2.2 route: mass-weight and diagonalize the whole thing.
+        let a0_sq = crate::constants::ANGSTROM_TO_BOHR * crate::constants::ANGSTROM_TO_BOHR;
+        let ndof = 3 * mol.atoms.len();
+        let mut mw = Matrix::zeros(ndof, ndof);
+        for i in 0..ndof {
+            for j in 0..ndof {
+                let mij =
+                    (MASS[mol.atoms[i / 3].z as usize] * MASS[mol.atoms[j / 3].z as usize]).sqrt();
+                mw[(i, j)] = hessian[(i, j)] * a0_sq / mij;
+            }
+        }
+        let (eigs, _) = symmetric_eigen(&mw).unwrap();
+        let unprojected: Vec<f64> = eigs
+            .iter()
+            .map(|&l| {
+                if l >= 0.0 {
+                    SQRT_EV_PER_ANG2_AMU_TO_CM * l.sqrt()
+                } else {
+                    -SQRT_EV_PER_ANG2_AMU_TO_CM * (-l).sqrt()
+                }
+            })
+            .collect();
+        eprintln!(
+            "    unprojected (all 9): {:?}",
+            unprojected.iter().map(|f| f.round()).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "    projected   (3):     {:?}   rigid-body residual {:?}",
+            vib.frequencies_cm
+                .iter()
+                .map(|f| f.round())
+                .collect::<Vec<_>>(),
+            vib.rigid_body_frequencies_cm
+                .iter()
+                .map(|f| f.round())
+                .collect::<Vec<_>>()
+        );
+        // A rigid-body direction here is nowhere near zero, so the old "|nu| < 50" tag would have
+        // both missed it and mislabelled whichever vibration fell below the cut.
+        let residual = vib
+            .rigid_body_frequencies_cm
+            .iter()
+            .fold(0.0_f64, |m, f| m.max(f.abs()));
+        assert!(
+            residual > 50.0,
+            "this geometry is too close to stationary to make the point: {residual}"
+        );
+        // And the vibrations themselves move.
+        let shift = unprojected[6..]
+            .iter()
+            .zip(&vib.frequencies_cm)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("    largest vibration shifted by {shift:.1} cm^-1");
+        assert!(shift > 1.0, "the projection changed nothing: {shift}");
     }
 }

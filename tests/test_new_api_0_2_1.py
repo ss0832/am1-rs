@@ -147,18 +147,25 @@ def test_unrestricted_orbitals_carry_the_beta_channel():
 def test_molden_has_the_expected_sections_and_matches_the_orbitals():
     text = native.molden(WATER_Z, WATER_XYZ)
     lines = [ln.strip() for ln in text.splitlines()]
-    for section in ("[Molden Format]", "[Atoms] Angs", "[STO]", "[MO]"):
+    # `[GTO]` since 0.2.3: `[STO]` is exact for this basis and read by almost no viewer.
+    for section in ("[Molden Format]", "[Atoms] Angs", "[GTO]", "[MO]"):
         assert section in lines, f"missing section {section}"
-    # One [STO] line per atomic orbital.
-    sto = lines.index("[STO]")
+    assert "[STO]" not in lines
+    # One [GTO] atom block per atom, each ended by a blank line.
+    gto = lines.index("[GTO]")
     mo = lines.index("[MO]")
-    assert mo - sto - 1 == 6
+    assert sum(1 for ln in lines[gto:mo] if ln.startswith("s ")) == 3
+    assert sum(1 for ln in lines[gto:mo] if ln.startswith("p ")) == 1
+    # And the exact Slater basis is still reachable, with one line per atomic orbital.
+    slater = [ln.strip() for ln in native.molden(WATER_Z, WATER_XYZ, basis="sto").splitlines()]
+    assert slater.index("[MO]") - slater.index("[STO]") - 1 == 6
     # The energies in the file are the SCF's, in Hartree.
     written = [float(ln.split("=")[1]) for ln in lines if ln.startswith("Ene=")]
     o = native.orbitals(WATER_Z, WATER_XYZ)
     assert written == pytest.approx(list(o["energies_hartree"]), abs=1e-9)
-    # The caveat travels with the file.
-    assert "orthonormal AO basis" in text
+    # The caveat travels with the file. Since 0.2.3 the coefficients are transformed back by
+    # S^-1/2 instead, and the note says which of the two the file carries.
+    assert "Lowdin" in text and "S^-1/2" in text
 
 
 def test_molden_writes_both_spin_channels_for_an_open_shell():
@@ -192,11 +199,15 @@ def test_ir_spectrum_is_consistent_with_its_parts():
     fr = native.frequencies(WATER_Z, xyz)
     assert ir["frequencies_cm"] == pytest.approx(fr["frequencies_cm"], abs=1e-8)
 
-    # Water is bent: three vibrations, six rigid-body modes, all vibrations infrared active.
+    # Water is bent: three vibrations, six rigid-body directions removed before the
+    # diagonalization, all three vibrations infrared active.
     assert len(ir["vibrational_modes"]) == 3
+    assert ir["rigid_body_count"] == 6
+    assert len(ir["frequencies_cm"]) == 3
     for k in ir["vibrational_modes"]:
         assert ir["intensities_km_per_mol"][k] > 1.0
-    assert sum(1 for x in ir["translation_rotation_overlap"] if x > 0.5) == 6
+    # Nothing rigid-body survives into the mode list; measured rather than assumed.
+    assert all(x < 1e-16 for x in ir["translation_rotation_overlap"])
 
     # The intensity is the squared norm of the per-mode dipole derivative, times the constant.
     mode_apt = np.asarray(ir["mode_dipole_derivatives"])
@@ -206,12 +217,19 @@ def test_ir_spectrum_is_consistent_with_its_parts():
 
 
 def test_a_linear_molecule_reports_five_rigid_body_modes():
-    """Discovered from the eigenvectors, not assumed from `3N − 6`."""
+    """Discovered from the rank of the rigid-body span, not assumed from `3N − 6`."""
     co2_z = [6, 8, 8]
     b = 1.189308342
     co2 = [[0.0, 0.0, 0.0], [b, 0.0, 0.0], [-b, 0.0, 0.0]]
     fr = native.frequencies(co2_z, co2)
-    assert sum(1 for x in fr["translation_rotation_overlap"] if x > 0.5) == 5
+    # Since 0.2.3 the subspace is projected out rather than identified afterwards, so the count
+    # is reported directly and `3N - 5 = 4` vibrations come back.
+    assert fr["rigid_body_count"] == 5
+    assert len(fr["frequencies_cm"]) == 4
+    assert len(fr["all_frequencies_cm"]) == 9
+    assert len(fr["rigid_body_frequencies_cm"]) == 5
+    # The two degenerate bends must still be degenerate.
+    assert fr["frequencies_cm"][0] == pytest.approx(fr["frequencies_cm"][1], abs=1.0)
 
 
 # ------------------------------------------------------------------------- orbital response
@@ -396,6 +414,11 @@ _ASE_EQUIVALENT = {
     "single_point": "calculate",
     "gradient": "get_forces",
     "optimize": "optimize",
+    # `AM1.optimize` dispatches on `atoms.pbc`: molecular structures go to `native.optimize`,
+    # periodic ones to `native.pbc_optimize`, with `relax_cell` for the lattice. One ASE method
+    # for one capability — "relax this structure" — rather than two that differ only in whether
+    # the caller remembered which kind of structure they had.
+    "pbc_optimize": "optimize",
     "hessian": "get_hessian",
     "frequencies": "get_frequencies",
     "am1_bcc": "get_am1_bcc_charges",
@@ -527,7 +550,7 @@ def test_ase_ir_and_molden_round_trip():
     path = os.path.join(tempfile.mkdtemp(), "wavefunction.molden")
     atoms.calc.write_molden(path, atoms)
     text = open(path, encoding="utf-8").read()
-    assert "[Molden Format]" in text and "[STO]" in text
+    assert "[Molden Format]" in text and "[GTO]" in text
 
     orbitals = atoms.calc.get_orbitals(atoms)
     written = [float(ln.split("=")[1]) for ln in text.splitlines() if ln.strip().startswith("Ene=")]

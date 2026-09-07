@@ -52,6 +52,20 @@ pub enum ScfAccelerator {
 
 #[derive(Clone, Debug)]
 pub struct Am1Options {
+    /// Iteration cap for the coupled-perturbed (CPHF) solve behind an analytic Hessian.
+    ///
+    /// Was a private constant through 0.2.2, so a system whose response needed more passes had no
+    /// way to ask for them short of editing the crate. The response solve is a separate fixed
+    /// point from the SCF -- it converges at its own rate and fails for its own reasons -- so it
+    /// gets its own limit rather than sharing [`Self::max_scf`].
+    pub cphf_max_iter: usize,
+    /// Convergence threshold on the CPHF fixed-point residual.
+    ///
+    /// A response cannot be converged past the density it is the derivative of, so tightening this
+    /// below the SCF's own accuracy asks for precision that is not there -- the same trap
+    /// `pbc::dfpt::DfptOptions::cpscf_tol` documents, where a default three orders inside `p_tol`
+    /// was refusing converged answers.
+    pub cphf_tol: f64,
     pub charge: f64,
     pub multiplicity: usize,
     /// Restricted vs unrestricted reference (see [`ScfReference`]). Default [`ScfReference::Auto`].
@@ -160,6 +174,9 @@ impl Am1Options {
 impl Default for Am1Options {
     fn default() -> Self {
         Self {
+            // The values these were as private constants; see the field docs.
+            cphf_max_iter: 100,
+            cphf_tol: 1.0e-9,
             charge: 0.0,
             multiplicity: 1,
             reference: ScfReference::Auto,
@@ -254,6 +271,12 @@ struct ScfState {
     converged: bool,
     iterations: usize,
     unrestricted: bool,
+    /// The commutator norm `‖[F, P]‖` the last iteration reached.
+    ///
+    /// Carried out so that a non-convergence can report the residual it actually got to. It used
+    /// to report `f64::NAN` — a hardcoded placeholder, not a measurement — which read as an
+    /// overflow and sent at least one investigation down the wrong path.
+    residual: f64,
 }
 
 /// The β spin channel's orbitals.
@@ -369,7 +392,7 @@ pub fn run_am1(
     if !state.converged {
         return Err(Am1Error::ScfNotConverged {
             iterations: state.iterations,
-            error: f64::NAN,
+            error: state.residual,
         });
     }
 
@@ -553,6 +576,7 @@ fn rhf_loop(
     let mut diis_e: Vec<Vec<f64>> = Vec::new();
     let mut diis_d: Vec<Vec<f64>> = Vec::new();
     let max_diis = 8;
+    let mut residual = f64::INFINITY;
     let accel = if options.use_diis {
         options.accelerator
     } else {
@@ -589,21 +613,43 @@ fn rhf_loop(
             }
         }
 
-        let f_use = {
+        // **Diverged**, rather than "not converged yet". Once a non-finite value reaches the
+        // density every tolerance comparison below is false — because every comparison against
+        // `NaN` is — so the loop would run to `max_scf` and then report `error=NaN`, after paying
+        // for hundreds of Fock builds that could not have converged. Saying so at the iteration
+        // it happens is both faster and a different diagnosis.
+        if !e_elec.is_finite() || !err_norm.is_finite() {
+            return Err(Am1Error::ScfDiverged {
+                iterations: iter + 1,
+            });
+        }
+
+        let mut weight = 0.0_f64;
+        let extrapolated = {
             let _t = crate::timing::Timer::start("scf:accel");
             match accel {
-                ScfAccelerator::None => f,
-                ScfAccelerator::Cdiis => {
-                    diis_extrapolate_packed(&diis_f, &diis_e, nao).unwrap_or(f)
-                }
+                ScfAccelerator::None => None,
+                ScfAccelerator::Cdiis => diis_extrapolate_packed(&diis_f, &diis_e, nao),
                 ScfAccelerator::AdiisCdiis => {
                     if err_norm > options.adiis_switch {
-                        adiis_extrapolate_packed(&diis_d, &diis_f, nao).unwrap_or(f)
+                        // A-DIIS coefficients live on the simplex, so their weight is 1 by
+                        // construction and there is nothing to bound.
+                        adiis_extrapolate_packed(&diis_d, &diis_f, nao).map(|m| (m, 1.0))
                     } else {
-                        diis_extrapolate_packed(&diis_f, &diis_e, nao).unwrap_or(f)
+                        diis_extrapolate_packed(&diis_f, &diis_e, nao)
                     }
                 }
             }
+        };
+        // A non-finite extrapolation is a dropped step, not a failed run. `f` is still alive
+        // here precisely so the fallback costs nothing: matching on the `Option` rather than
+        // `unwrap_or(f)` keeps the plain Fock available without a clone.
+        let f_use = match extrapolated {
+            Some((x, w)) if x.as_slice().iter().all(|v| v.is_finite()) => {
+                weight = w;
+                x
+            }
+            _ => f,
         };
         let (eps, c) = {
             let _t = crate::timing::Timer::start("scf:eigen");
@@ -613,13 +659,37 @@ fn rhf_loop(
             let _t = crate::timing::Timer::start("scf:density");
             density_from_coeff(&c, n_occ, 2.0)
         };
+
         let dp = rms_diff(&p_new, &density);
         let de = (e_elec - e_old).abs();
+
+        if scf_debug() {
+            // The gap is the band-crossing diagnostic: sharp aufbau occupies the lowest `n_occ`
+            // orbitals, so a gap that closes means the occupied *set* can change identity between
+            // iterations, which is the classic driver of an SCF that will not settle.
+            let gap = if n_occ > 0 && n_occ < eps.len() {
+                eps[n_occ] - eps[n_occ - 1]
+            } else {
+                f64::NAN
+            };
+            eprintln!(
+                "  scf {:4}  E {:>16.8}  dE {:>10.3e}  dP {:>10.3e}  |[F,P]| {:>10.3e}  \
+                 gap {:>9.4} eV  diis w {:>8.2}",
+                iter + 1,
+                e_elec,
+                de,
+                dp,
+                err_norm,
+                gap,
+                weight
+            );
+        }
 
         mo_energies = eps;
         mo_coeff = c;
         density = p_new;
         e_old = e_elec;
+        residual = err_norm;
         if iter > 0 && de < options.e_tol && (dp < options.p_tol || err_norm < 1.0e-7) {
             converged = true;
             break;
@@ -641,6 +711,7 @@ fn rhf_loop(
         converged,
         iterations,
         unrestricted: false,
+        residual,
     })
 }
 
@@ -682,6 +753,7 @@ fn uhf_loop(
     let mut hist_fb: Vec<Vec<f64>> = Vec::new();
     let mut hist_err: Vec<Vec<f64>> = Vec::new();
     let max_diis = 8;
+    let mut residual = f64::INFINITY;
 
     for iter in 0..options.max_scf {
         iterations = iter + 1;
@@ -724,6 +796,12 @@ fn uhf_loop(
             (fa, fb)
         };
 
+        if !e_elec.is_finite() || !err_norm.is_finite() {
+            return Err(Am1Error::ScfDiverged {
+                iterations: iter + 1,
+            });
+        }
+
         let (ea_eps, ca) = symmetric_eigen(&fa_use)?;
         let (eb_eps, cb) = symmetric_eigen(&fb_use)?;
         let pa_new = density_from_coeff(&ca, n_alpha, 1.0);
@@ -738,6 +816,7 @@ fn uhf_loop(
         pa = pa_new;
         pb = pb_new;
         e_old = e_elec;
+        residual = err_norm;
         if iter > 0 && de < options.e_tol && (dp < options.p_tol || err_norm < 1.0e-7) {
             converged = true;
             break;
@@ -774,6 +853,7 @@ fn uhf_loop(
         converged,
         iterations,
         unrestricted: true,
+        residual,
     })
 }
 
@@ -907,10 +987,73 @@ fn diis_coeffs_packed(es: &[Vec<f64>], n: usize) -> Option<Vec<f64>> {
     solve_bordered_small(&b, &rhs)
 }
 
+// # A stagnation escape was tried here, and removed
+//
+// 0.2.3 briefly added one: after twelve iterations without the commutator beating its own best,
+// halve the density mixing and clear the DIIS history. It was added on the hypothesis that the
+// molecular solver's lack of damping — the periodic one has mixed at 0.3 since 0.2.0 — was why a
+// dense crystal would not converge.
+//
+// It was removed because both halves of that hypothesis failed a measurement:
+//
+// * it did not fix the target. Zincblende AlP still plateaus at `‖[F,P]‖ ≈ 1.3` with damping all
+//   the way down to 0.05, and plain iteration, CDIIS and the hybrid all fail there identically —
+//   so the accelerator was never the problem (`tests/scf_hardening.rs`);
+// * it broke cases that worked. "Twelve iterations without beating the best" is true of a run
+//   improving steadily but *slowly*, and a graphene supercell improves by 0.4 % per iteration —
+//   the rule fired five times, drove the mixing to 0.05, and turned an 800-iteration budget from
+//   comfortable into insufficient. A lone carbon atom's convergent tail triggered it too, at
+//   `‖[F,P]‖ = 9.3e-6`, shifting a converged energy by `1e-4` eV.
+//
+// What survives from that work is what was measured to help: the DIIS weight bound with a
+// shrinking window, the divergence guard, the real residual in the error, and `AM1_SCF_DEBUG`.
+
+/// Trace the SCF iteration when `AM1_SCF_DEBUG` is set: energy, both convergence measures, the
+/// commutator norm, the HOMO–LUMO gap and the DIIS step weight.
+///
+/// The gap and the weight are there because they are what distinguish the two ways an SCF fails.
+/// A gap that collapses means the occupied set can swap identity between iterations under sharp
+/// aufbau filling; a weight that runs away means the extrapolation has left the span its
+/// residuals resolve. Both look identical from the outside — a residual that stops falling — and
+/// they call for different remedies.
+fn scf_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AM1_SCF_DEBUG").is_some())
+}
+
 /// CDIIS on packed histories: coefficients from the errors, applied to the Focks.
-fn diis_extrapolate_packed(fs: &[Vec<f64>], es: &[Vec<f64>], n: usize) -> Option<Matrix> {
+///
+/// Returns the extrapolated Fock and the step's `Σ|c_i|`, the latter only so the
+/// `AM1_SCF_DEBUG` trace can show it. A **non-finite** weight is refused, because the resulting
+/// Fock would be too; nothing else is.
+///
+/// # A `Σ|c_i|` bound was tried here, and removed
+///
+/// The periodic solver caps the weight at 40 (`pbc::scf::MAX_DIIS_WEIGHT`) and this one does not,
+/// which looked like an oversight worth closing — especially since the frozen-phonon path runs
+/// *this* solver on a supercell. Measured, it was not:
+///
+/// * refusing an over-weight step costs the acceleration outright. The A-DIIS→CDIIS hybrid fell
+///   back to plain iteration the moment it handed over, taking 23 iterations on formaldehyde
+///   where it takes **11** without the bound;
+/// * shrinking the history window instead recovered formaldehyde but not a diamond supercell,
+///   whose error vectors are near-dependent in *every* window near convergence — it ended its run
+///   on plain iteration with `dE` stuck at 1e-5 eV after 800 passes, where unbounded CDIIS
+///   converges;
+/// * and it fixed nothing. The case it was added for — zincblende AlP — fails identically with
+///   plain iteration, CDIIS and the hybrid, so no Fock-space extrapolation was ever the problem
+///   (`tests/scf_hardening.rs`).
+///
+/// A large weight here is a symptom of a near-dependent history, which near convergence is the
+/// normal state of affairs, and treating it as a fault costs more than it saves.
+fn diis_extrapolate_packed(fs: &[Vec<f64>], es: &[Vec<f64>], n: usize) -> Option<(Matrix, f64)> {
     let coeffs = diis_coeffs_packed(es, n)?;
-    Some(combine_packed(fs, &coeffs, Tri::Symmetric, n))
+    // The last entry of the bordered solution is the Lagrange multiplier, not a coefficient.
+    let weight: f64 = coeffs.iter().take(fs.len()).map(|c| c.abs()).sum();
+    if !weight.is_finite() {
+        return None;
+    }
+    Some((combine_packed(fs, &coeffs, Tri::Symmetric, n), weight))
 }
 
 /// A-DIIS on packed histories. Same quadratic as [`adiis_extrapolate`], same expansion of the

@@ -19,8 +19,8 @@ with the Dewar–Sabelli–Klopman semiempirical two-electron integrals).
 | RHF/UHF NDDO SCF with **SAD** guess + **A-DIIS→CDIIS** convergence acceleration | ✅ |
 | Mulliken charges, dipole, HOMO/LUMO | ✅ |
 | Nuclear gradient — closed-form (dual-number AD), **RHF & UHF, all elements** | ✅ matches a full-SCF finite difference to 1e-9–1e-7 eV/Bohr, checked for all 21 elements |
-| L-BFGS geometry optimization | ✅ |
-| Analytic Hessian (CPHF/UCPHF) + harmonic frequencies, **RHF & UHF, all elements** | ✅ |
+| L-BFGS geometry optimization | ✅ molecules; and **under a cell since 0.2.3**, on the k-point forces and — with `relax_cell` — the analytic stress, at an optional target pressure |
+| Analytic Hessian (CPHF/UCPHF) + harmonic frequencies, **RHF & UHF, all elements** | ✅ the Hessian is the raw Cartesian matrix; frequencies come from it with the rigid-body subspace **projected out** since 0.2.3, so `3N − 6` (or `3N − 5`, or `3N − 3`) modes come back and none of them is a translation |
 | Open-shell **UHF** (radicals, odd-electron ions, `multiplicity > 1`) | ✅ |
 | **Periodic boundary conditions** — 1D / 2D / 3D, Γ and k-points, RHF & UHF | ✅ energy, analytic forces, analytic stress |
 | **Divide-and-conquer** — molecular **and periodic**, RHF & UHF, non-neutral | ✅ linear-scaling diagonalization; reachable from Rust, Python and ASE |
@@ -28,31 +28,23 @@ with the Dewar–Sabelli–Klopman semiempirical two-electron integrals).
 | Rust API, Python-native API, ASE `Calculator` | ✅ |
 | Ewald summation, 1D / 2D (Parry) / 3D, monopole channel | ✅ |
 | **DFPT at arbitrary q**, arbitrary k | ✅ arbitrary mesh or explicit k-list; DIIS-accelerated |
-| Periodic Γ **and k-point** analytic Hessian; phonons `Φ(T)→D(q)` | ✅ |
+| Periodic Γ **and k-point** analytic Hessian; phonons `Φ(T)→D(q)` | ✅ since 0.2.3 the supercell blocks are filed under their **minimum image** and `Φ(T) = Φ(−T)ᵀ` is imposed alongside the acoustic sum rule, which is what makes the interpolated bands right and the three acoustic modes exactly zero. Validated against measured dispersions: polyethylene 1.5–5.3 %, graphene +11 to +22 % |
 | Born charges `Z*`, dielectric tensor `ε_∞`, **LO–TO splitting** | ✅ Born charges in every dimensionality. `ε_∞` as a **constant** is 3D — below three the dielectric response is a *function* of `q` and tends to 1, which `dielectric_function` gives (that is physics, not a gap). LO–TO likewise: only 3D is discontinuous at Γ, so below three there is nothing to add and it is measured rather than argued. All reachable from Rust, Python and ASE |
 | Divide-and-conquer under PBC, with **analytic stress** | ✅ |
 | **External electric field** — energy, analytic gradient, analytic Hessian | ✅ molecules; and under a cell since 0.2.2 when the field is **orthogonal to every lattice vector** (normal to a slab, transverse to a chain). A component *along* a periodic direction is refused by name: `F·R` is unbounded there |
 | **Infrared spectra** — atomic polar tensor (raw 3 × 3N) and km/mol intensities | ✅ |
-| **Wavefunction output** — orbital energies/coefficients (both spins), Molden `[STO]`/`[MO]` | ✅ |
+| **Wavefunction output** — orbital energies/coefficients (both spins), Molden | ✅ `[GTO]` by default since 0.2.3 (a run-time-fitted Gaussian expansion, overlap > 0.99999 with the Slater shell it replaces), with `S^{−1/2}C` so the coefficients belong to the functions the file lists. `[STO]` is exact for this basis and kept behind `--molden-basis sto`, because almost no viewer reads that section |
 | **First-order orbital response** `U^j_{ai}` from the CPHF | ✅ lazy; never runs from an energy call |
 | Long-range monopole term **inside the DFPT response** | ✅ 3D cells, every `q`, via a phased Ewald sum: independent of the real-space cutoff to 2e-16 at `q = ¼`, against 1e-1 for the truncated sum alone. `D(q)` is then the *full* dynamical matrix — do not also apply `frequencies_with_lo_to`. 1D/2D have no such term and say so |
 | **Berry-phase polarization** (King-Smith–Vanderbilt) | ✅ since 0.2.2 — modulo the polarization quantum, exactly translation-invariant, and `Ω ∂P/∂τ` reproduces the CPHF Born charges to 7.5e-13 e where the two formalisms are comparable. 3D |
 | **Finite electric field along a periodic direction** | ✅ since 0.2.2 — the Berry-phase electric enthalpy `E − Ω 𝓔·P`, not `F·R`. `α = Ω ∂P/∂𝓔` matches the CPHF polarizability to 0.03–0.47 % where the two compute the same object, converging as `O(1/J²)` |
 | **Open-shell (UHF) k-point response** — Hessian, Born charges | ✅ since 0.2.2 — two coupled spin channels. Forcing UHF on a closed shell reproduces the restricted force constants to 8.9e-16 eV/Bohr² |
 | `ε_∞` for a chain or a slab | ✅ since 0.2.2 — `dielectric_with_extent`, with the thickness (slab) or cross-section (wire) a **required argument**, and the depolarization factor of the assumed body carried with it. What does not depend on that choice is reported alongside |
-| **Periodic SCF convergence** | ✅ since 0.2.2 — Pulay mixing (140 → 22 iterations), a degenerate-level fix in the complex eigensolver (a methane slab could not converge at all before), and the energy evaluated where the functional is stationary |
+| **Periodic SCF convergence** | ✅ since 0.2.2 — Pulay mixing (140 → 22 iterations), a degenerate-level fix in the complex eigensolver (a methane slab could not converge at all before), and the energy evaluated where the functional is stationary. **Since 0.2.3 a fallback pipeline**: the controller reads the residual trace and answers a growing or oscillating one with Kerker preconditioning, a stalled one (ratio > 0.99) with a raised electronic temperature that is then **annealed back**, since smearing moves the fixed point and `converged` must mean converged at the smearing you asked for. `PbcResult::fallback` reports what it did |
+| **Phonon eigenvectors** | ✅ since 0.2.3 — `eigenvectors=True` / `ForceConstants::modes`, in two conventions: `polarization` (orthonormal `e(q)`, for sums over modes) and `displacements` (`e_a/√m_a`, for moving a structure along a mode). Through 0.2.2 a mode could not be followed from a phonon result at all |
+| **Divide-and-conquer geometry optimization**, and a CLI switch | ✅ since 0.2.3 — `--dc` on `energy`, `gradient` and `optimize`; L-BFGS on the DC gradient, so a structure too large for one full SCF can be relaxed and not only measured |
 | SAM1 | ⛔ a different integral engine, not a reparameterization |
 
-**Validation.** Against MOPAC 22's own reference outputs on CO₂, for both AM1 and RM1: **all
-twelve molecular-orbital energies** to 0.0022 eV (AM1) and 0.0034 eV (RM1) — degeneracies
-included — Mulliken charges to **1.4e-5 e**, Koopmans IP to 4e-4 eV, optimized bond length to
-5e-5 Å. Periodic NVE conserves energy in 1D, 2D and 3D; the analytic stress matches a strain
-finite difference to 5e-9 eV/Bohr³. The field gradient and Hessian match full-SCF finite
-differences to 1.8e-6 eV/Bohr and 8.1e-7 relative; the infrared tensor is checked three
-independent ways; the CPHF coefficients `U` are checked against a finite difference of the MO
-coefficients to 9.6e-7. The clamped-ion polarizability is checked for **magnitude**, not only
-shape, against the isolated molecule's finite-field value — 0.17 % at a 12 Å box.
-Divide-and-conquer reproduces the full SCF to 9e-13 eV when the buffer covers the molecule.
 
 The **formulas themselves** are checked piece by piece in `tests/theory_components.rs`, because
 an end-to-end identity says a chain is wrong without saying which link. The long-range form of
@@ -118,24 +110,65 @@ that name the corresponding PySEQM source for each ported piece.
 am1_rs_cli energy    examples/water.xyz            # ΔHf, charges, dipole, HOMO/LUMO
 am1_rs_cli gradient  examples/methane.xyz          # energy + gradient (Hartree/Bohr)
 am1_rs_cli optimize  examples/water.xyz --opt-output opt.xyz
-am1_rs_cli frequencies opt.xyz                             # harmonic frequencies (cm^-1)
+am1_rs_cli frequencies opt.xyz                             # 3N−6 vibrations (cm^-1)
+am1_rs_cli orbitals  opt.xyz --orbital-coefficients        # energies, occupations, MO matrix
+am1_rs_cli molden    opt.xyz --molden-output opt.molden    # wavefunction for a viewer
 am1_rs_cli charges   examples/ethanol.xyz --mol2-output ethanol.mol2   # AM1-BCC
 am1_rs_cli charges   examples/ethanol.xyz --mulliken                   # raw AM1 charges
 ```
 
-Options: `--charge Q`, `--multiplicity M` (`M > 1` requires UHF), `--reference auto|rhf|uhf`
-(or the `--rhf` / `--uhf` shortcuts — `--uhf` runs a singlet unrestricted), `--opt-output`,
-`--mol2-output`.
+Options: `--method am1|rm1`, `--charge Q`, `--multiplicity M` (`M > 1` requires UHF),
+`--reference auto|rhf|uhf` (or the `--rhf` / `--uhf` shortcuts — `--uhf` runs a singlet
+unrestricted), `--field FX FY FZ`, `--opt-output`, `--mol2-output`, `--molden-output`,
+`--molden-basis gto|sto`, `--orbital-coefficients`.
+
+### Periodic boundary conditions on the command line
+
+A cell comes from an extended-XYZ `Lattice="…"` comment line, or from `--cell` — 1, 3, 6 or 9
+numbers (cube; `a b c`; `a b c α β γ`; or three lattice vectors). Which axes are periodic is set
+by `--pbc x|y|z|xy|xyz|none`, or **one axis at a time** with `--pbc-x` / `--pbc-y` / `--pbc-z`,
+which accumulate. `--no-pbc` drops the cell and runs the contents of it as a molecule.
+
+```
+am1_rs_cli energy    slab.xyz --cell 8.0 --pbc-x --pbc-y --kpts 4 4 1
+am1_rs_cli gradient  chain.xyz --kpts 1 1 8               # forces and stress
+am1_rs_cli optimize  chain.xyz --kpts 1 1 8 --relax-cell  # atoms and lattice
+am1_rs_cli frequencies chain.xyz --kpts 1 1 8             # phonons at q = 0
+am1_rs_cli phonons   chain.xyz --supercell 1 1 4 --qpath 0 0 0 0 0 0.5
+```
+
+`energy`, `gradient`, `optimize` and `frequencies` take the periodic path whenever a cell is
+present; `charges`, `ir` and `molden` are molecular-only and say so rather than ignoring it.
+`--kpts` is the SCF's Monkhorst–Pack mesh; `phonons` takes `--supercell` and then either
+`--qpoints` (a list) or `--qpath` with `--qpath-points`, defaulting to the supercell's
+commensurate `q`.
 
 `pip install am1-rs-python` puts the same CLI on `PATH` as **`am1-rs`** (or `python -m am1_rs`,
 where the scripts directory is not on `PATH`). A wheel cannot ship the Rust binary alongside the
 extension module, so this is a Python front end over the same native bindings — same modes, same
-flags, and byte-identical output, which `tests/test_cli.py` checks by diffing the two per mode
-rather than leaving it as a claim.
+flags, and byte-identical output. `tests/test_cli_matrix.py` checks that by running **every mode
+against every combination of the options that apply to it** and diffing the two, rather than
+leaving it as a claim.
 
 ```bash
 am1-rs energy examples/water.xyz
 ```
+
+### Large systems on the command line
+
+`--dc` runs the linear-scaling divide-and-conquer SCF instead of the full one, on `energy`,
+`gradient` and `optimize`. `--dc-core N` sets the target atoms per core region (12) and
+`--dc-buffer R` the buffer radius in Ångström (5.82); either implies `--dc`.
+
+```
+am1-rs energy   cluster.xyz --dc --dc-buffer 7.0
+am1-rs optimize cluster.xyz --dc --opt-output relaxed.xyz
+```
+
+A mode `--dc` does not cover **refuses** rather than ignoring the flag: `frequencies --dc` would
+return full-SCF frequencies at full-SCF cost, which is the one thing a user reaching for `--dc`
+is trying to avoid, and silently doing it is worse than saying so. The buffer radius is the
+accuracy knob, and it is not monotonic — see [`docs/divide-conquer.md`](docs/divide-conquer.md).
 
 ## Rust API
 
@@ -275,82 +308,21 @@ see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Net charge is preserved.
 
 ## Documentation
 
-- [`docs/rust-api.md`](docs/rust-api.md) — complete Rust API (every public type and function, with examples).
+[**`docs/`**](docs/README.md) has an index that routes by question rather than by file. The
+documents themselves:
+
 - [`docs/python-api.md`](docs/python-api.md) — complete Python API (native functions + ASE calculator).
-- [`docs/scope.md`](docs/scope.md) — feature matrix, known gaps, units contract.
-- [`docs/theory.md`](docs/theory.md) — equations, CPHF, and references.
+- [`docs/rust-api.md`](docs/rust-api.md) — complete Rust API (every public type and function, with examples).
+- [`docs/scope.md`](docs/scope.md) — feature matrix, known gaps, units contract. Each entry says
+  what was **measured**, not what was intended; it is the right place to check a claim made
+  anywhere else.
 - [`docs/methods.md`](docs/methods.md) — AM1 vs RM1, element coverage.
 - [`docs/pbc.md`](docs/pbc.md) — periodic boundary conditions: setup, conventions, **and the
   limitations, which matter**.
 - [`docs/divide-conquer.md`](docs/divide-conquer.md) — the formulation, and a precise statement
   of what became linear.
+- [`docs/theory.md`](docs/theory.md) — equations, CPHF, and references.
 
-## Limitations
-
-- Open-shell systems use spin-unrestricted **UHF** (`--multiplicity M`, `M > 1`); no
-  spin-contamination annihilation or ROHF yet.
-- Gradients use the exact NDDO **Hellmann–Feynman** formula (no Pulay term — the AO basis is
-  orthonormal) and are **fully closed-form for every case** — RHF and UHF, all elements. Each
-  term (two-electron, core-attraction, overlap radial *and* angular, core-core) is forward-mode
-  dual-number AD with **no finite differences**; for heavy elements (`n ≥ 4`) the derivative is
-  AD *through* the numerical Slater-overlap quadrature. Open-shell (UHF) uses the spin-resolved
-  fixed-density gradient. All match a full-SCF finite difference to ~1e-7.
-- The Hessian is **fully analytic for every case** — closed-shell RHF *and* open-shell UHF, all
-  elements — with **no finite differences**. The skeleton (fixed-density) second derivative is
-  closed-form **second-order** forward-AD ([`Dual2`](src/dual2.rs)) of the integral kernels
-  (through the quadrature for `n ≥ 4`); the orbital-relaxation term solves the **CPHF** equations
-  against the orbital Hessian (RHF), or the **coupled α/β UCPHF** equations (UHF), in the compact
-  MO occupied–virtual subspace. It agrees with an independent finite-difference Hessian to within
-  that reference's own truncation error (~1e-5). Harmonic frequencies come from its mass-weighted
-  diagonalization. (A finite-difference gradient/Hessian is retained only as a validation gate.)
-- Overlaps for valence shells `n ≤ 3` use the exact analytic Slater kernel; `n ≥ 4` (heavy AM1
-  elements) use a general numerical Slater overlap (Gauss–Legendre quadrature) whose value and
-  derivatives are both consistent (the derivatives are taken analytically through the
-  quadrature). Its agreement with the analytic kernel is **~1e-7 for `1s|1s` and ~5e-4 for
-  `2s|2s`** — the figures the tests assert. Earlier releases claimed 1e-8, which was never true
-  for the general case. That quadrature error is the accuracy floor for gradients and Hessians
-  involving those elements.
-- **AM1-BCC typing is not byte-identical to antechamber.** The correction values are the exact
-  `BCCPARM.DAT`, and the perception now covers rings by size, Hückel aromaticity, delocalized
-  groups (carboxylate, nitro, phosphate, sulfonate) and bond orders beyond C/N/O. What remains
-  unimplemented is antechamber's AR1..AR5 aromatic sub-classification and its indole-specific
-  rules. Of the 66 `BCCPARM.DAT` entries still unreachable, 26 are identically zero and 40
-  duplicate the aromatic type exactly — so reaching them would change no charge. Anything the
-  perception cannot do confidently is reported in `BccResult::warnings`. See
-  [`docs/scope.md`](docs/scope.md).
-- **Ewald summation covers the monopole channel, in every dimensionality — and nothing beyond that
-  channel.** 3D uses the tin-foil reciprocal sum, a slab the 2D Parry form, a chain a real-space
-  sum with an analytic Hurwitz-zeta tail; all three are Madelung-exact to 1e-10 and independent of
-  the splitting parameter. That is what makes a **charged** cell meaningful — 0.20 eV of drift
-  across a 6.5× range of real-space cutoff, against 403 eV without it.
-
-  Since 0.2.2 the `R⁻³` Klopman–Ohno tail is summed too, and the cutoff drift it used to leave goes
-  from 0.10 eV per unit `ln r_c` to **0.000**. What remains in real space is the higher multipole
-  series, which converges slowly (3e-4 eV between a 40 and a 640 Bohr cutoff on a water chain) but
-  does converge — `Σ_T R⁻ᵖ` is absolutely convergent for `p > D`, so only ranks 0 and 1 ever needed
-  reciprocal-space treatment. See [`docs/pbc.md`](docs/pbc.md).
-- **Divide-and-conquer makes the diagonalization linear, not the whole calculation.** The NDDO
-  Coulomb sum stays `O(N²)` because the two-centre integrals decay as `1/R`. Measured scaling
-  exponents, from operation counters rather than a stopwatch: diagonalization 1.15, exchange
-  1.06, retained density blocks 1.05, **Coulomb 2.02**; on 3D clusters up to 2187 atoms the
-  fitted `Σn³` exponent is 1.25 against 3 for a full diagonalization. In wall clock it crosses
-  over around 200 atoms; the speedup at 768 atoms ranged 1.4–6.3× across runs, a spread that is
-  machine load rather than the algorithm — which is why the scaling claim is asserted on counters
-  and not a stopwatch. See [`docs/divide-conquer.md`](docs/divide-conquer.md).
-- **`ε_∞` is a clamped-ion field response, not a Berry-phase polarization.** It comes from a
-  uniform-field CPHF coupled to this model's own dipole operator. The usual origin ambiguity
-  does not bite — measured at 1.6 × 10⁻¹⁵ under a 1.7 Bohr shift — but the clamped-ion, dipole
-  character of the operator is a real approximation, and LO–TO splitting inherits it.
-- **DFPT's long-range monopole term is 3D only, and it makes `D(q)` the full dynamical matrix.**
-  On a 3D cell it is included at every `q` through a phased Ewald sum. Because the element
-  dropped is `k = 0` rather than the long-wavelength `k = −q` — the only choice that is periodic
-  in `q` and well defined at a zone boundary — `D(q)` carries the non-analytic part itself and
-  its `q → 0` limit is direction dependent. Do **not** then add `frequencies_with_lo_to`, which
-  exists to give the *supercell* route that same physics. On a chain or a slab the term does not
-  exist at all and `LongRange::Require` says so rather than approximating.
-- **SAM1 is not implemented.** It replaces the multipole expansion with scaled STO-3G integrals,
-  so it is a different integral engine rather than a reparameterization and does not share the
-  code path RM1 does.
 
 ## References
 
@@ -385,9 +357,21 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 ```
 
 The full text is in [`LICENSE`](LICENSE), kept verbatim. Bundled third-party material — the
-PySEQM-derived parameter tables (BSD-3-Clause), the antechamber `BCCPARM.DAT` (GPL-3), and the
-MOPAC-derived RM1 parameters (Apache-2.0) — is documented in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), with the retained licences under
-`third_party/`. Both files ship inside the wheel, which the BSD-3-Clause requires and CI checks.
+PySEQM-derived parameter tables (BSD-3-Clause), the antechamber `BCCPARM.DAT` and
+`ATOMTYPE_BCC.DEF` (GPL-3), and the MOPAC-derived RM1 parameters and per-element reference tables
+(Apache-2.0) — is documented in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), with the
+retained licence and a per-work provenance note under `third_party/`.
+
+The linked Rust crates are a separate and larger set — over a hundred of them end up statically
+inside `am1_rs._native` and the CLI binary — and their notices are in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md), generated from the resolved dependency graph
+by `tools/collect_dependency_licenses.py`.
+
+Every one of those files ships inside the wheel, under `dist-info/licenses/`, and in the sdist and
+the `.crate`: MIT requires its copyright and permission notice to accompany a copy and a statically
+linked binary is one, BSD-3-Clause clause 2 says the same of a binary redistribution, and
+Apache-2.0 §4(a)–(c) want the licence text, the retained attribution and the statement of changes.
+CI fails the release if any of them is missing, and `tests/attribution.rs` fails the build if the
+inputs that determine them drift.
 
 [`gfn1-rs`]: https://github.com/ss0832/gfn1-rs_proto

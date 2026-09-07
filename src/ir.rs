@@ -88,7 +88,7 @@ pub struct IrSpectrum {
     pub frequencies_cm: Vec<f64>,
     /// Integrated absorption coefficient per mode, km/mol.
     pub intensities_km_per_mol: Vec<f64>,
-    /// `∂μ/∂Q_k` per mode, a `3 × 3N` matrix in `D·Å⁻¹·amu^{−1/2}`; columns are modes.
+    /// `∂μ/∂Q_k` per mode, a `3 × (3N − n_rigid)` matrix in `D·Å⁻¹·amu^{−1/2}`; columns are modes.
     ///
     /// The dense per-mode tensor, kept because the intensity throws away the *direction* of the
     /// transition dipole and that direction is what a polarized measurement sees.
@@ -101,10 +101,9 @@ impl IrSpectrum {
     /// Modes whose rigid-body overlap is below `threshold` (0.5 is a reasonable split), as
     /// `(index, frequency_cm, intensity)`.
     ///
-    /// Translations and rotations have an intensity too — a rigid molecule with a net charge
-    /// really does absorb — but it is not a vibrational band, and filtering by *what the
-    /// eigenvector is* rather than by a frequency cutoff is what makes this correct for a linear
-    /// molecule, which has five rigid-body modes rather than six.
+    /// Since 0.2.3 every mode is already a vibration — the rigid-body subspace is projected out
+    /// of the Hessian before it is diagonalized — so this returns all of them for any sane
+    /// `threshold` and is kept as a check on that, not as a filter anything needs to apply.
     pub fn vibrational_bands(&self, threshold: f64) -> Vec<(usize, f64, f64)> {
         self.modes
             .translation_rotation_overlap
@@ -214,15 +213,22 @@ pub fn ir_spectrum_from_response(
 }
 
 /// Project an atomic polar tensor onto normal modes and convert to km/mol.
+///
+/// `ndof` and the mode count are no longer the same number: since 0.2.3 the rigid-body directions
+/// are projected out of the Hessian before it is diagonalized, so there are `3N − n_rigid` modes
+/// to contract the `3 × 3N` tensor against. Every loop that runs over modes uses `nmode`, and
+/// every loop that runs over Cartesian degrees of freedom uses `ndof`; conflating them is what
+/// would put an intensity on a mode that does not exist.
 fn assemble(molecule: &Molecule, apt: Matrix, modes: VibrationalModes) -> IrSpectrum {
     let ndof = apt.cols;
+    let nmode = modes.modes.cols;
     let inv_sqrt_mass: Vec<f64> = (0..ndof)
         .map(|j| 1.0 / MASS[molecule.atoms[j / 3].z as usize].sqrt())
         .collect();
 
-    let mut mode_apt = Matrix::zeros(3, ndof);
-    let mut intensities = vec![0.0; ndof];
-    for k in 0..ndof {
+    let mut mode_apt = Matrix::zeros(3, nmode);
+    let mut intensities = vec![0.0; nmode];
+    for k in 0..nmode {
         let mut norm2 = 0.0;
         for alpha in 0..3 {
             // ∂μ_α/∂Q_k = Σ_j (∂μ_α/∂R_j) L_{jk} / √m_j, then e → D/Å.

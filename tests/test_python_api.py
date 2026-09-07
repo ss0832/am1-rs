@@ -103,8 +103,15 @@ def test_native_hessian_reproduces_frequencies():
     m = np.array([MASS[z] for z in WATER_Z for _ in range(3)])
     mw = Hev / np.sqrt(np.outer(m, m))
     eig = np.sort(np.linalg.eigvalsh(mw))
-    ref = np.sort(np.asarray(am1_rs.frequencies(WATER_Z, WATER_XYZ, 0.0, 1)["eigenvalues"]))
+    # `eigenvalues` is the *projected* spectrum since 0.2.3 (3N − 6 entries, rigid-body directions
+    # removed before the diagonalization), which is not what diagonalizing the raw Hessian gives
+    # at a non-stationary geometry. `all_eigenvalues` is the unprojected 3N spectrum, and that is
+    # what this test is about: the matrix `hessian` returns is the one `frequencies` diagonalizes.
+    f = am1_rs.frequencies(WATER_Z, WATER_XYZ, 0.0, 1)
+    ref = np.sort(np.asarray(f["all_eigenvalues"]))
     assert np.abs(eig - ref).max() < 1e-9
+    # And the projected spectrum is a subset of it, up to the rigid-body directions taken out.
+    assert len(f["eigenvalues"]) == len(ref) - f["rigid_body_count"] == 3
 
 
 def test_native_hessian_matches_finite_difference():

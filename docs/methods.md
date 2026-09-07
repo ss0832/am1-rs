@@ -80,10 +80,15 @@ parameter set against published values and the resulting properties against MOPA
 
 ## SAM1
 
-**Not available in 0.2.0.** SAM1 (Dewar, Jie & Yu, *Tetrahedron* **49**, 5003 (1993)) replaces
-the multipole expansion with two-centre integrals computed from an STO-3G Gaussian basis and
-then scaled, so it is a genuinely different engine rather than a reparameterization — it does
-not fit the shared code path that AM1 and RM1 share. It is deferred to 0.3.0.
+**Not implemented, as of 0.2.3.** SAM1 (Dewar, Jie & Yu, *Tetrahedron* **49**, 5003 (1993))
+replaces the multipole expansion with two-centre integrals computed from an STO-3G Gaussian basis
+and then scaled, so it is a genuinely different engine rather than a reparameterization — it does
+not fit the code path AM1 and RM1 share. Deferred to 0.3.0.
+
+The Gaussian machinery it would need is now partly present for an unrelated reason: `src/gto.rs`
+fits Slater shells to Gaussian contractions at run time for Molden output. That is a fitted
+expansion of *this* basis, not SAM1's own STO-3G integrals with its own scaling, so it is a
+starting point rather than the thing itself.
 
 ---
 

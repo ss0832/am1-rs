@@ -86,7 +86,33 @@ relaxed = opt["positions_angstrom"]
 ```
 
 Keys: `positions_angstrom` (list of `[x, y, z]`, Å), `energy_hartree`,
-`heat_of_formation_kcal`, `converged` (bool), `iterations` (int).
+`heat_of_formation_kcal`, `converged` (bool), `iterations` (optimizer steps),
+`scf_iterations` (the SCF's own count at the final geometry), plus the whole `single_point`
+report — `energy_ev`, `electronic_ev`, `core_ev`, `homo_ev`, `lumo_ev`, `charges`,
+`dipole_debye`, `dipole_magnitude`, `unrestricted`.
+
+## `pbc_optimize(numbers, positions, cell, pbc, ...) -> dict`
+
+The periodic counterpart. L-BFGS on the k-point forces and, with `relax_cell=True`, on the
+analytic stress as well.
+
+```python
+r = am1_rs.pbc_optimize(Z, xyz, cell, [True, True, True], kpts=(4, 4, 4), relax_cell=True)
+relaxed_positions = r["positions_angstrom"]
+relaxed_cell      = r["cell_angstrom"]        # you need both, not just the positions
+```
+
+The variables are **scaled coordinates plus a strain** measured from the starting cell, so an
+atom on a symmetry site stays on it while the lattice deforms. A strain component is a variable
+only when both of its axes are periodic, so a slab's vacuum direction and a chain's two
+transverse directions are frozen by construction. `pressure` (eV per Bohr^d) minimizes the
+enthalpy `E + PΩ` instead of the energy; it does nothing without `relax_cell`.
+
+Keys: `positions_angstrom`, `cell_angstrom`, `pbc`, `energy_ev`, `free_energy_ev`,
+`electronic_ev`, `core_ev`, `forces_ev_per_angstrom`, `stress_voigt` (eV/Å^d, ASE's
+convention), `stress_voigt_ev_per_bohr` (the crate's own units), `pressure`,
+`max_force_ev_per_bohr`, `charges`, `fermi_energy_ev`, `converged`, `iterations`,
+`scf_iterations`, `k_points`.
 
 ## `frequencies(numbers, positions, charge=0.0, multiplicity=1, reference="auto") -> dict`
 
@@ -95,11 +121,40 @@ point** (optimize first) for physically meaningful modes.
 
 ```python
 freq = am1_rs.frequencies(Z, opt["positions_angstrom"])
-print(freq["frequencies_cm"][-3:])      # three highest modes, cm^-1
+print(freq["frequencies_cm"])            # 3N - 6 vibrations, cm^-1
+print(freq["rigid_body_count"])          # 6, or 5 for a linear molecule, or 3 for an atom
 ```
 
-Keys: `frequencies_cm` (list[float], cm⁻¹ ascending; negative = imaginary mode),
-`eigenvalues` (list[float], mass-weighted Hessian eigenvalues, eV/(Å²·amu)).
+**Since 0.2.3 these are vibrations only.** The rigid-body subspace is projected out of the
+mass-weighted Hessian before it is diagonalized, so `frequencies_cm` has `3N − rigid_body_count`
+entries and none of them is a translation or a rotation. There is nothing left to filter, and the
+`|ν| < 50 cm⁻¹` rule that used to do the filtering is gone — it mislabelled a soft torsion as a
+rotation, and away from a stationary point it missed rotations entirely, which carry real
+curvature there (measured on a stretched water: **1238 cm⁻¹**).
+
+`rigid_body_count` is the *rank* of the translation/rotation span, so a linear molecule gives 5
+without anything having to decide that it is linear.
+
+Keys: `frequencies_cm` (list[float], cm⁻¹ ascending; negative = imaginary mode), `eigenvalues`
+(mass-weighted Hessian eigenvalues, eV/(Å²·amu)), `modes` and `cartesian_displacements`
+(`3N × (3N − rigid_body_count)`, columns are modes), `translation_rotation_overlap` (zero to
+roundoff now, kept so the projection can be *checked*), `rigid_body_count`, and
+`rigid_body_frequencies_cm` — the curvature left in each removed direction, which is zero only at
+a stationary point and is the honest replacement for the old threshold.
+
+The **Hessian itself is untouched** by any of this: `hessian(...)` below returns the raw
+`3N × 3N` Cartesian matrix, and the projection happens only inside the frequency step.
+
+**The CPHF solver's own limits, since 0.2.3.** `cphf_max_iter` (100) and `cphf_tol` (`1e-9`) are
+arguments to `frequencies`, `hessian`, `ir_spectrum`, `vibrations` and the ASE calculator; they
+were private constants, so a system whose response needed more passes could not be given them
+without editing the crate. They are **separate from `max_scf` on purpose**: the response is a
+different fixed point from the ground state, converging at its own rate and failing for its own
+reasons, and a Hessian that ran out of CPHF iterations is a wrong Hessian rather than a slow one.
+
+```python
+am1_rs.frequencies(Z, xyz, cphf_max_iter=400, cphf_tol=1e-10)
+```
 
 ## `hessian(numbers, positions, charge=0.0, multiplicity=1, reference="auto") -> dict`
 
@@ -190,6 +245,27 @@ Increase `buffer_radius` (Bohr) until the property you care about stops moving; 
 covering the molecule reproduces the full SCF exactly. See
 [divide-conquer.md](divide-conquer.md) for a precise statement of what became linear.
 
+**Geometry optimization, since 0.2.3.** `optimize=True` runs L-BFGS on the DC gradient, so a
+structure too large for one full SCF can be relaxed and not only measured. `opt_max_iter` and
+`opt_gtol` bound it.
+
+```python
+r = am1_rs.divide_conquer(Z, xyz, buffer_radius=11.0, optimize=True, opt_gtol=1e-3)
+r["positions_angstrom"]                      # the relaxed geometry
+r["opt_converged"], r["opt_iterations"]      # the optimizer's own verdict
+r["max_force_ev_per_bohr"]                   # what it reached
+```
+
+`opt_converged` is the optimizer's, `converged` the final SCF's — they are separate questions and
+a run can fail either one.
+
+The buffer radius is doing more work here than in a single point: a gradient error that is
+tolerable for one energy accumulates over an optimization path, and the non-monotonic convergence
+in `buffer_radius` means a *larger* buffer is not guaranteed to give a closer minimum. Relax at two
+buffers before trusting the geometry.
+
+The same thing from the command line is `--dc` on the `optimize` mode.
+
 ---
 
 ## External electric field
@@ -209,9 +285,10 @@ field reaches the Hessian only through the CPHF response.
 **Under a cell, the field must be orthogonal to every lattice vector** — normal to a slab,
 transverse to a chain. `F·R` shifts by `F·T` under translation by `T`, so the perturbation is
 lattice-periodic exactly when `F·T = 0`; a component *along* a periodic direction is an error
-naming itself. For the response along a periodic direction use `dielectric()`, which is the linear
-regime; the finite/non-linear regime there needs the Berry-phase electric enthalpy and is not
-implemented.
+naming itself. For the response along a periodic direction use `dielectric()` in the linear regime,
+or **`finite_field()`** beyond it — the Berry-phase electric enthalpy `E − Ω 𝓔·P`, which is what
+that direction requires and which has been available since 0.2.2. (This paragraph said it was not
+implemented, which was already wrong in 0.2.2.)
 
 Refused for **any** cell through 0.2.1, which threw the well-defined cases out with the ill-defined
 one.
@@ -259,6 +336,55 @@ r["hessian_ev_per_bohr2"]       # the Hessian it was solved alongside — both f
 r = am1_rs.orbital_response(Z, xyz, response_density=True)   # opt-in: 3N AO matrices
 ```
 
+## Phonons: `phonons(...)`
+
+Frequencies from supercell force constants. `supercell` is the convergence knob and controls two
+things at once — how far `Φ(T)` is resolved before truncation, and, since Γ on an `n`-fold
+supercell is the primitive cell at `n` k-points, the k-sampling of the electronic structure
+underneath.
+
+```python
+r = am1_rs.phonons(Z, xyz, cell, pbc, supercell=(2, 2, 2), q_points=[[0, 0, 0], [0.5, 0, 0]])
+r["frequencies_cm"]      # one list of 3N per q, ascending; negative means imaginary
+r["commensurate_q"]      # the q this supercell represents *exactly*
+r["acoustic_sum_rule_error_before"], r["transpose_asymmetry_before"]
+```
+
+**Mode vectors, since 0.2.3.** `eigenvectors=True` adds four keys, each `[n_q][3N][3N]`:
+
+```python
+r = am1_rs.phonons(Z, xyz, cell, pbc, supercell=(2, 2, 2), eigenvectors=True)
+e = np.asarray(r["polarization_re"])  + 1j * np.asarray(r["polarization_im"])
+u = np.asarray(r["displacements_re"]) + 1j * np.asarray(r["displacements_im"])
+```
+
+The real and imaginary halves come back separately because the native layer returns plain nested
+lists and has no complex type to put them in; `np.asarray(re) + 1j*np.asarray(im)` is the intended
+recombination, and the ASE calculator does it for you.
+
+**The two conventions are not interchangeable.** `polarization` is the orthonormal eigenvector
+`e(q)` of the *mass-weighted* dynamical matrix — the right thing for any sum over modes.
+`displacements` is `e_a/√m_a`, what an atom actually does, and the right thing to add to a
+geometry; it is deliberately not renormalized, so a heavy and a light atom keep their true relative
+amplitude. Using one where the other belongs is a mass-weighting error of `√(m_a/m_b)` — a factor
+of 4 between hydrogen and oxygen — which looks entirely plausible in a rendered animation.
+
+Columns are modes, ordered like `frequencies_cm`, with three components per atom in x, y, z order.
+They are complex because away from Γ the pattern carries a Bloch phase from cell to cell; the
+imaginary part is that phase, not numerical residue. To follow an imaginary mode downhill:
+
+```python
+u = np.asarray(r["displacements_re"])[0][:, 0].reshape(-1, 3)   # lowest mode at the first q
+xyz_displaced = xyz + 0.3 * u / np.abs(u).max()                 # then re-optimize
+```
+
+Off by default: `n_q · (3N)²` complex numbers is a large array to return unasked when a band
+structure covers a few hundred q.
+
+**No LO–TO splitting here** — a truncated real-space `Φ(T)` cannot carry the dipole–dipole tail, so
+longitudinal and transverse optical branches come out degenerate as `q → 0`, which in a polar
+crystal they are not. `lo_to_frequencies` adds it; `dfpt` already contains it.
+
 ## Periodic response: `pbc_hessian`, `born_charges`, `dielectric`, `dfpt`, `lo_to_frequencies`
 
 ```python
@@ -277,6 +403,18 @@ am1_rs.lo_to_frequencies(Z, xyz, cell, pbc, supercell=(2, 2, 2), direction=(1, 0
 `dfpt` samples the ground state on the same k set as the response, deliberately: the
 coupled-perturbed equations assume the zeroth order satisfies the SCF condition. If the response
 solve hits its iteration cap, loosen `cpscf_tol` — it is a mixed fixed point, not a Newton solve.
+
+**A partially occupied ground state raises, since 0.2.3.** Every function in this section is
+derived at fixed integer occupation — there is no `∂f/∂ε` term in the coupled-perturbed equations,
+so the Fermi surface cannot respond to the perturbation — and through 0.2.2 they ran anyway and
+returned a plausible wrong number. The `ValueError` names the k-point, the band and the occupation.
+
+This is **not** a restriction on `smearing_ev`: the judgement is on the *converged* occupations, so
+a gapped system smeared well below its gap is accepted (measured, cubic BN at 4×4×4 and
+`smearing_ev=0.3` passes). Widening `kT` is what pushes occupations away from integer; a finer
+`kpts` is the remedy that does not. Pass `allow_fractional_occupations=True` to run it anyway and
+get the 0.2.2 number, which is wrong by a whole band on the CPHF path. See
+[pbc.md](pbc.md#fractional-occupations-are-refused-not-approximated).
 
 **Pick one route for the long-range part, not both.** On a 3D cell `dfpt` returns the *full*
 `D(q)` — the long-range monopole channel is inside it — so its `q → 0` limit is already direction
@@ -373,7 +511,7 @@ unit convention and not of feature. `tests/test_new_api_0_2_1.py` asserts that.
 | `write_molden(path, atoms)` | `molden` | — |
 | `get_am1_bcc_charges(atoms)` | `am1_bcc` | `e` |
 | `optimize(atoms)` | `optimize` | Å, written back into `atoms` unless `apply=False` |
-| `get_phonons(atoms, supercell=…)` | `phonons` | cm⁻¹ |
+| `get_phonons(atoms, supercell=…, eigenvectors=False)` | `phonons` | cm⁻¹; with `eigenvectors=True`, `polarization` and `displacements` as **complex** `(n_q, 3N, 3N)` arrays — this layer joins the native halves |
 | `get_dfpt_frequencies(q, atoms)` | `dfpt` | cm⁻¹ |
 | `get_lo_to_frequencies(direction=…)` | `lo_to_frequencies` | cm⁻¹, 3D cells only |
 | `get_born_charges(atoms)` | `born_charges` | `e`, shape `(nat, 3, 3)` |

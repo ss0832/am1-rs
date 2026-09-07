@@ -165,6 +165,32 @@ impl<S: Scalar> PairTwoElecG<S> {
         let start = pack(a, b) * self.w_cols;
         &self.w[start..start + self.w_cols]
     }
+
+    /// Number of packed bra pairs — `10` for an `s,p` atom, `1` for hydrogen.
+    #[inline]
+    pub fn packed_bras(&self) -> usize {
+        if self.w_cols == 0 {
+            0
+        } else {
+            self.w.len() / self.w_cols
+        }
+    }
+
+    /// Number of packed ket pairs, i.e. the length of a [`Self::two_e_row`].
+    #[inline]
+    pub fn packed_kets(&self) -> usize {
+        self.w_cols
+    }
+
+    /// The row of integrals for a bra pair given **already packed**.
+    ///
+    /// [`Self::two_e_row`] packs `(a, b)` on every call; a loop that already runs over packed bra
+    /// indices has nothing left to pack, and the periodic Fock's Coulomb term is such a loop.
+    #[inline]
+    pub fn w_row(&self, packed: usize) -> &[S] {
+        let start = packed * self.w_cols;
+        &self.w[start..start + self.w_cols]
+    }
 }
 
 /// f64 alias used by the SCF/Fock.
